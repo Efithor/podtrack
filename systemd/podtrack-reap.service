@@ -1,0 +1,11 @@
+[Unit]
+Description=podtrack autonomous reaper (reconcile + mirror + safe-teardown of idle/expired pods)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Fixed identity so reaper actions are attributable in the events log.
+Environment=PODTRACK_OWNER_UUID=reaper PODTRACK_LABEL=reaper
+# Adjust path if dev-one venv moves.
+ExecStart=%h/venvs/dev-one/bin/podtrack reap
