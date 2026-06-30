@@ -1,0 +1,15 @@
+[project]
+name = "podtrack"
+version = "0.1.0"
+description = "Ownership-aware RunPod pod registry for agent streams"
+requires-python = ">=3.9"
+
+[project.scripts]
+podtrack = "podtrack:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["podtrack"]
