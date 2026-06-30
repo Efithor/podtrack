@@ -52,10 +52,22 @@ CRED_DIR = Path.home() / ".config/podtrack"
 CRED_PATH = CRED_DIR / "runpod.key"
 LEGACY_KEY = Path.home() / ".keys/runpod"
 RUNPOD_API = "https://api.runpod.io/graphql"
-SSH_KEY = Path.home() / ".ssh/id_ed25519"
+SSH_KEYS = [Path.home() / ".runpod/ssh/RunPod-Key-Go",   # RunPod pods
+            Path.home() / ".ssh/id_ed25519"]             # home box / generic
 SSH_USER = "root"                              # RunPod direct-SSH user
+
+
+def _ssh_key_for(pod) -> str:
+    """Resolve the SSH key for a pod: explicit per-pod key, else first that exists."""
+    if pod.get("ssh_key") and Path(pod["ssh_key"]).expanduser().exists():
+        return str(Path(pod["ssh_key"]).expanduser())
+    for k in SSH_KEYS:
+        if k.exists():
+            return str(k)
+    return str(SSH_KEYS[-1])
 LIVE_STATUSES = ("provisioning", "running", "exited")
 DEADMAN_SH = Path(__file__).with_name("deadman.sh")
+JOB_HB_FILE = "/root/.podtrack_job_alive"      # job writes ISO-UTC ts here; reaper reads it
 
 
 def _now() -> datetime:
@@ -162,23 +174,26 @@ def terminate_remote(pod_id: str):
 
 
 # ----------------------------------------------------------------- ssh helpers
-def _ssh_base(ip, port):
-    return ["ssh", "-i", str(SSH_KEY), "-p", str(port),
+def _ssh_base(pod):
+    return ["ssh", "-i", _ssh_key_for(pod), "-p", str(pod["ssh_port"]),
             "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=12",
-            f"{SSH_USER}@{ip}"]
+            f"{SSH_USER}@{pod['ssh_ip']}"]
 
 
 def ssh_run(pod, remote_cmd, timeout=60):
     if not pod.get("ssh_ip"):
         return 255, "", "no ssh endpoint in registry (run reconcile)"
-    p = subprocess.run(_ssh_base(pod["ssh_ip"], pod["ssh_port"]) + [remote_cmd],
-                       capture_output=True, text=True, timeout=timeout)
-    return p.returncode, p.stdout, p.stderr
+    try:
+        p = subprocess.run(_ssh_base(pod) + [remote_cmd],
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 255, "", "ssh timeout"
 
 
 def rsync_pull(pod, remote_path, local_path, timeout=1800):
     Path(local_path).mkdir(parents=True, exist_ok=True)
-    ssh = (f'ssh -i {SSH_KEY} -p {pod["ssh_port"]} '
+    ssh = (f'ssh -i {_ssh_key_for(pod)} -p {pod["ssh_port"]} '
            f'-o StrictHostKeyChecking=no -o ConnectTimeout=12')
     p = subprocess.run(
         ["rsync", "-az", "--partial", "-e", ssh,
@@ -204,6 +219,8 @@ NEW_COLS = {
     "kill_after": "TEXT", "idle_kill_min": "INTEGER", "last_job_heartbeat": "TEXT",
     "remote_path": "TEXT", "local_path": "TEXT", "deadman": "INTEGER DEFAULT 0",
     "last_gpu_util": "INTEGER",
+    "idle_strikes": "INTEGER DEFAULT 0",   # consecutive idle reconciles (sustained-idle gate)
+    "ssh_key": "TEXT",                     # per-pod SSH key (RunPod vs home-box differ)
 }
 
 
@@ -250,18 +267,19 @@ class Registry:
 
     # ---- CRUD ----
     def register(self, pod_id, gpu_type=None, ssh_ip=None, ssh_port=None, cost_per_hr=None,
-                 status="running", remote_path=None, local_path=None, notes=None):
+                 status="running", remote_path=None, local_path=None, ssh_key=None, notes=None):
         self.db.execute(
             "INSERT INTO pods(pod_id,owner_uuid,owner_label,gpu_type,ssh_ip,ssh_port,status,"
-            "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,ssh_key,notes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(pod_id) DO UPDATE SET owner_uuid=excluded.owner_uuid,"
             "owner_label=excluded.owner_label,gpu_type=COALESCE(excluded.gpu_type,gpu_type),"
             "ssh_ip=COALESCE(excluded.ssh_ip,ssh_ip),ssh_port=COALESCE(excluded.ssh_port,ssh_port),"
             "status=excluded.status,remote_path=COALESCE(excluded.remote_path,remote_path),"
-            "local_path=COALESCE(excluded.local_path,local_path)",
+            "local_path=COALESCE(excluded.local_path,local_path),"
+            "ssh_key=COALESCE(excluded.ssh_key,ssh_key)",
             (pod_id, self.uuid, self.label, gpu_type, ssh_ip, ssh_port, status, cost_per_hr,
-             _ts(), _ts(), remote_path, local_path, notes))
+             _ts(), _ts(), remote_path, local_path, ssh_key, notes))
         self.db.commit()
         self._log(pod_id, "register", f"{self.label} gpu={gpu_type}")
         return self.get(pod_id)
@@ -431,38 +449,74 @@ class Registry:
                 self.teardown(pid, force=True, skip_pull=True)
         return s
 
+    # ---- job heartbeat (positive liveness signal) ----
+    def job_heartbeat(self, pod_id):
+        """Mark the job alive NOW (for local jobs; remote jobs use JOB_HB_FILE)."""
+        self.db.execute("UPDATE pods SET last_job_heartbeat=? WHERE pod_id=?", (_ts(), pod_id))
+        self.db.commit()
+
+    def _read_remote_heartbeat(self, pod):
+        """Best-effort: pull the job's heartbeat file (ISO-UTC ts) from the pod via SSH.
+        Jobs keep it fresh with e.g. `while :; do date -u +%FT%TZ > JOB_HB_FILE; sleep 60; done`."""
+        rc, out, _ = ssh_run(pod, f"cat {JOB_HB_FILE} 2>/dev/null", timeout=20)
+        ts = out.strip()
+        if rc == 0 and ts:
+            try:
+                _parse(ts)                      # validate ISO-8601
+                self.db.execute("UPDATE pods SET last_job_heartbeat=? WHERE pod_id=?",
+                                (ts, pod["pod_id"]))
+                self.db.commit()
+            except Exception:
+                pass
+
     # ---- autonomous reaper (run by the systemd timer) ----
-    def reap(self, mirror=True, pet_min=30, idle_grace_min=20):
-        """Reconcile -> mirror live pods -> pet healthy ones -> safe-teardown
-        TTL-expired / idle pods. Autonomous: it kills, trusting the pull-verify gate."""
+    def reap(self, mirror=True, pet_min=30, startup_grace_min=15,
+             idle_strikes_needed=3, hb_grace_min=20):
+        """Autonomous: reconcile -> mirror -> pet healthy -> safe-teardown TTL/idle pods.
+
+        v0.2.1 safety (a momentary 0%-GPU snapshot no longer kills an active pod):
+          - startup grace: never idle-kill a pod younger than `startup_grace_min`.
+          - SUSTAINED idle: idle-kill needs `idle_strikes_needed` CONSECUTIVE idle
+            reconciles (busy GPU resets the counter), not a single snapshot.
+          - heartbeat override: a fresh job heartbeat (< `hb_grace_min`) blocks idle-kill.
+        A hard `kill_after` TTL still fires regardless (the owner set it deliberately)."""
         recon = self.reconcile()
         report = {"reaped": [], "petted": [], "mirrored": [], "kept": [], **recon}
         now = _now()
         for pod in self.list_pods("all"):
-            if pod["status"] not in ("running",):
+            if pod["status"] != "running":
                 continue
             pid = pod["pod_id"]
             if mirror and pod["remote_path"]:
                 ok, _ = self.sync(pid)
                 if ok:
                     report["mirrored"].append(pid)
-            # decide fate
-            ttl_expired = pod["kill_after"] and now > _parse(pod["kill_after"])
+            self._read_remote_heartbeat(pod)
+            pod = self.get(pid)                                  # reload after hb/strike updates
+            # sustained-idle accounting
+            gpu_idle_now = pid in recon["idle_or_cpu"]
+            strikes = (pod["idle_strikes"] or 0) + 1 if gpu_idle_now else 0
+            self.db.execute("UPDATE pods SET idle_strikes=? WHERE pod_id=?", (strikes, pid))
+            self.db.commit()
+            # decision
+            dep = _parse(pod["deployed_at"])
+            young = dep is not None and (now - dep) < timedelta(minutes=startup_grace_min)
             hb = _parse(pod["last_job_heartbeat"])
-            gpu_idle = pid in recon["idle_or_cpu"]
-            stale_job = (not hb) or (now - hb > timedelta(minutes=idle_grace_min))
-            idle_kill = gpu_idle and stale_job
+            fresh_hb = hb is not None and (now - hb) < timedelta(minutes=hb_grace_min)
+            ttl_expired = pod["kill_after"] and now > _parse(pod["kill_after"])
+            idle_kill = (strikes >= idle_strikes_needed) and not young and not fresh_hb
             if ttl_expired or idle_kill:
                 try:
-                    self.teardown(pid, as_reaper=True)     # bypass ownership; keep pull->verify
-                    report["reaped"].append((pid, "ttl" if ttl_expired else "idle"))
+                    self.teardown(pid, as_reaper=True)          # bypass ownership; keep pull-verify
+                    report["reaped"].append((pid, "ttl" if ttl_expired else f"idle x{strikes}"))
                 except SystemExit as e:
-                    report["kept"].append((pid, f"teardown-refused: {str(e)[:80]}"))
+                    report["kept"].append((pid, f"refused: {str(e)[:60]}"))
             elif pod["deadman"]:
-                self.pet(pid, pet_min)                      # healthy -> keep alive
+                self.pet(pid, pet_min)
                 report["petted"].append(pid)
             else:
-                report["kept"].append((pid, "healthy/no-deadman"))
+                report["kept"].append(
+                    (pid, f"strikes={strikes} young={young} fresh_hb={bool(fresh_hb)}"))
         return report
 
 
@@ -484,9 +538,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami"); sub.add_parser("adopt-key")
     r = sub.add_parser("register"); r.add_argument("pod_id")
-    for f in ("--label", "--gpu", "--ssh-ip", "--remote-path", "--local-path"):
+    for f in ("--label", "--gpu", "--ssh-ip", "--remote-path", "--local-path", "--ssh-key"):
         r.add_argument(f)
     r.add_argument("--ssh-port", type=int); r.add_argument("--cost", type=float)
+    jh = sub.add_parser("job-heartbeat"); jh.add_argument("pod_id")
     li = sub.add_parser("list"); gg = li.add_mutually_exclusive_group()
     for fl in ("all", "mine", "others"):
         gg.add_argument(f"--{fl}", action="store_const", const=fl, dest="scope")
@@ -511,8 +566,11 @@ def main():
     reg = Registry(owner_label=getattr(a, "label", None))
     if a.cmd == "register":
         p = reg.register(a.pod_id, gpu_type=a.gpu, ssh_ip=a.ssh_ip, ssh_port=a.ssh_port,
-                         cost_per_hr=a.cost, remote_path=a.remote_path, local_path=a.local_path)
+                         cost_per_hr=a.cost, remote_path=a.remote_path, local_path=a.local_path,
+                         ssh_key=a.ssh_key)
         print(f"registered {p['pod_id']} -> '{p['owner_label']}'")
+    elif a.cmd == "job-heartbeat":
+        reg.job_heartbeat(a.pod_id); print(f"job-heartbeat {a.pod_id}")
     elif a.cmd == "list":
         _print_pods(reg.list_pods(a.scope or "all"))
     elif a.cmd == "claim":

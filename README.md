@@ -91,6 +91,18 @@ systemctl --user list-timers podtrack-reap.timer
 Runs `podtrack reap` every 5 min (`Persistent=true` catches up missed runs). Acts under a
 fixed `reaper` identity; reaper teardowns bypass *ownership* but keep the *pull-verify* gate.
 
+**Reaper safety (v0.2.1).** Idle-kill requires ALL of: (a) the pod is past a **startup grace**
+(`startup_grace_min`, default 15); (b) **sustained idle** — `idle_strikes_needed` (default 3)
+*consecutive* idle reconciles, so a busy GPU resets the counter and a momentary 0%-GPU snapshot
+never kills; (c) **no fresh job heartbeat**. A hard `kill_after` TTL still fires regardless.
+
+**Job heartbeat.** A long job that may go GPU-idle (CPU phases) should keep a heartbeat file
+fresh so the reaper sees it's alive — on the pod:
+```bash
+( while :; do date -u +%FT%TZ > /root/.podtrack_job_alive; sleep 60; done ) &
+```
+The reaper reads that file via SSH each cycle. (Local jobs can call `podtrack job-heartbeat <id>`.)
+
 ## Storage
 
 - Registry DB: `~/.local/share/podtrack/pods.db` (override `$PODTRACK_HOME`). Tables: `pods`
@@ -99,10 +111,15 @@ fixed `reaper` identity; reaper teardowns bypass *ownership* but keep the *pull-
 
 ## Status
 
-- **Tested (logic):** registry/ownership, label-continuity + reclaim, claim, reconcile
-  (read path, live), reap decision logic (TTL + idle), schema migration.
-- **Needs a live-pod smoke test:** `arm`/`pet`/`sync`/`teardown` over real SSH+rsync, and a
-  real `podTerminate`. Verify on the next deploy before trusting unattended.
+- **Validated live (2026-06-30, real H100):** deploy→`register`, `reconcile`, and autonomous
+  `reap`→`podTerminate` all worked end-to-end. (The first run also exposed the v0.2.1 bugs below —
+  the reaper killed an *active* pod that had no heartbeat and was caught at a single 0%-GPU
+  snapshot. Fixed.)
+- **Tested (logic):** v0.2.1 reaper safety — startup grace, sustained-idle strikes, heartbeat
+  override, per-pod SSH-key resolution; plus ownership/label-continuity, claim, schema migration.
+- **Still needs a live smoke:** `arm`/`pet`/`sync`/`probe` over real SSH+rsync to a RunPod pod
+  (now use the correct RunPod key). Non-fatal if they fail — the grace+strikes safety net protects
+  active pods regardless.
 
 ## Integration (follow-up)
 
