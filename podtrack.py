@@ -84,6 +84,14 @@ def _parse(ts: str | None) -> datetime | None:
     return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
+def _cfg(cli_val, env_name, default) -> int:
+    """Resolve a reaper knob: CLI arg > env var > built-in default."""
+    if cli_val is not None:
+        return cli_val
+    env = os.environ.get(env_name)
+    return int(env) if env else default
+
+
 # ----------------------------------------------------------------------- identity
 def whoami(uuid: str | None = None, label: str | None = None) -> tuple[str, str]:
     """Resolve (owner_uuid, owner_label). UUID is ephemeral (changes across
@@ -557,6 +565,10 @@ def main():
     td.add_argument("--force", action="store_true"); td.add_argument("--skip-pull", action="store_true")
     rc = sub.add_parser("reconcile"); rc.add_argument("--terminate-untracked", action="store_true")
     rp = sub.add_parser("reap"); rp.add_argument("--no-mirror", action="store_true")
+    rp.add_argument("--startup-grace", type=int, help="min; env PODTRACK_STARTUP_GRACE_MIN (15)")
+    rp.add_argument("--idle-strikes", type=int, help="consecutive idle reconciles; env PODTRACK_IDLE_STRIKES (3)")
+    rp.add_argument("--hb-grace", type=int, help="min; env PODTRACK_HB_GRACE_MIN (20)")
+    rp.add_argument("--pet-min", type=int, help="min; env PODTRACK_PET_MIN (30)")
     a = ap.parse_args()
 
     if a.cmd == "adopt-key":
@@ -593,7 +605,12 @@ def main():
         print(f"live={len(s['live'])} untracked={s['untracked']} vanished={s['vanished']} "
               f"idle_or_cpu={s['idle_or_cpu']}")
     elif a.cmd == "reap":
-        rep = reg.reap(mirror=not a.no_mirror)
+        rep = reg.reap(
+            mirror=not a.no_mirror,
+            startup_grace_min=_cfg(a.startup_grace, "PODTRACK_STARTUP_GRACE_MIN", 15),
+            idle_strikes_needed=_cfg(a.idle_strikes, "PODTRACK_IDLE_STRIKES", 3),
+            hb_grace_min=_cfg(a.hb_grace, "PODTRACK_HB_GRACE_MIN", 20),
+            pet_min=_cfg(a.pet_min, "PODTRACK_PET_MIN", 30))
         print(f"reaped={rep['reaped']} petted={rep['petted']} mirrored={len(rep['mirrored'])} "
               f"untracked={rep['untracked']} kept={len(rep['kept'])}")
 

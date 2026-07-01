@@ -103,6 +103,27 @@ fresh so the reaper sees it's alive — on the pod:
 ```
 The reaper reads that file via SSH each cycle. (Local jobs can call `podtrack job-heartbeat <id>`.)
 
+## Recommended settings
+
+The reaper knobs are tunable **per-run** (`podtrack reap --startup-grace .. --idle-strikes ..
+--hb-grace .. --pet-min ..`) or via **env** (in the systemd unit or shell):
+`PODTRACK_STARTUP_GRACE_MIN`, `PODTRACK_IDLE_STRIKES`, `PODTRACK_HB_GRACE_MIN`, `PODTRACK_PET_MIN`.
+Precedence: CLI arg > env > default.
+
+**Key relationship:** the *sustained-idle window before a kill* = **timer cadence × idle-strikes**.
+At the default 5-min cadence, `idle_strikes=3` ⇒ ~15 min of continuous GPU-idle required. Change
+the cadence in `systemd/podtrack-reap.timer` (`OnUnitActiveSec`).
+
+| Workload | grace | strikes | hb-grace | cadence | `kill_after` TTL | Rationale |
+|---|---|---|---|---|---|---|
+| **Long GPU jobs (DFT)** — *default* | 15 | 3 | 20 | 5 min | runtime + margin | GPU busy ~continuously; 15-min sustained-idle is safe. Set a TTL as the hard backstop; heartbeat during CPU phases. |
+| **Interactive / smoke tests** | 5 | 2 | 10 | 5 min | 30–60 min | Reap fast to cap spend on throwaway pods. |
+| **Jobs with long CPU stages** (data prep, I/O) | 15 | 4–6 | 60 | 5 min | runtime + margin | GPU legitimately idle for stretches → **job heartbeats are essential**; widen hb-grace + strikes. |
+
+**Always set a `kill_after` TTL** at deploy (`PODTRACK_KILL_IN=<minutes>` or `podtrack arm
+--kill-in <minutes>`). It's the hard, idle-detection-independent cost backstop (the on-pod
+dead-man switch), and it's what protects you when the home box is asleep and can't run the reaper.
+
 ## Storage
 
 - Registry DB: `~/.local/share/podtrack/pods.db` (override `$PODTRACK_HOME`). Tables: `pods`

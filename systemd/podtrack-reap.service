@@ -7,5 +7,8 @@ Wants=network-online.target
 Type=oneshot
 # Fixed identity so reaper actions are attributable in the events log.
 Environment=PODTRACK_OWNER_UUID=reaper PODTRACK_LABEL=reaper
+# Tune the reaper without editing code (defaults shown; uncomment to override).
+# Also settable per-run: `podtrack reap --startup-grace .. --idle-strikes .. --hb-grace ..`
+#Environment=PODTRACK_STARTUP_GRACE_MIN=15 PODTRACK_IDLE_STRIKES=3 PODTRACK_HB_GRACE_MIN=20 PODTRACK_PET_MIN=30
 # Adjust path if dev-one venv moves.
 ExecStart=%h/venvs/dev-one/bin/podtrack reap
