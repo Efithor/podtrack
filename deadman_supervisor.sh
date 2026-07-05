@@ -20,11 +20,11 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG" 2>/dev/null || true; 
 
 log "supervisor up (pid $$)"
 while [ -f "$D/deadline" ]; do
-  if [ ! -x "$D/deadman.sh" ]; then
-    log "deadman.sh missing/not-executable; supervisor exiting"
+  if [ ! -f "$D/deadman.sh" ]; then
+    log "deadman.sh missing; supervisor exiting"
     break
   fi
-  "$D/deadman.sh"
+  bash "$D/deadman.sh"   # bash invocation: /dev/shm is noexec on RunPod images
   rc=$?
   # deadman.sh returns 0 only after a CONFIRMED fire (it also removes the
   # deadline file), so the loop guard above then exits. Any other exit means it

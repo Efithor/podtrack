@@ -263,7 +263,7 @@ def pod_desired_status(pod_id: str) -> str | None:
 # ----------------------------------------------------------------- ssh helpers
 def _ssh_base(pod):
     return ["ssh", "-i", _ssh_key_for(pod), "-p", str(pod["ssh_port"]),
-            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=12",
+            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
             f"{SSH_USER}@{pod['ssh_ip']}"]
 
 
@@ -294,7 +294,7 @@ def ssh_run(pod, remote_cmd, timeout=60, retries=2, warn=True):
 def rsync_pull(pod, remote_path, local_path, timeout=1800):
     Path(local_path).mkdir(parents=True, exist_ok=True)
     ssh = (f'ssh -i {_ssh_key_for(pod)} -p {pod["ssh_port"]} '
-           f'-o StrictHostKeyChecking=no -o ConnectTimeout=12')
+           f'-o StrictHostKeyChecking=no -o ConnectTimeout=30')
     p = subprocess.run(
         ["rsync", "-az", "--partial", "-e", ssh,
          f'{SSH_USER}@{pod["ssh_ip"]}:{remote_path.rstrip("/")}/',
@@ -471,8 +471,8 @@ class Registry:
 
     def _launch_deadman(self, pod):
         return ssh_run(
-            pod, f"setsid nohup {self.DEADMAN_PROC} "
-                 f">{self.DEADMAN_DIR}/supervisor.log 2>&1 &", timeout=20)
+            pod, f"setsid nohup bash {self.DEADMAN_PROC} "
+                 f"</dev/null >{self.DEADMAN_DIR}/supervisor.log 2>&1 &", timeout=20)
 
     def arm(self, pod_id, kill_in_min, token_file=None, kill_absolute_min=None):
         """Plant an on-pod self-destruct that fires at now+kill_in_min unless petted,
@@ -506,8 +506,8 @@ class Registry:
             f"cat > /dev/shm/podtrack/deadman.sh <<'PTEOF'\n{script}\nPTEOF\n"
             f"cat > /dev/shm/podtrack/deadman_supervisor.sh <<'PTSUP'\n{supervisor}\nPTSUP\n"
             f"chmod +x /dev/shm/podtrack/deadman.sh /dev/shm/podtrack/deadman_supervisor.sh && "
-            f"setsid nohup /dev/shm/podtrack/deadman_supervisor.sh "
-            f">/dev/shm/podtrack/supervisor.log 2>&1 &"
+            f"setsid nohup bash /dev/shm/podtrack/deadman_supervisor.sh "   # bash: /dev/shm is noexec on RunPod images
+            f"</dev/null >/dev/shm/podtrack/supervisor.log 2>&1 &"
         ), timeout=40)
         if rc != 0:
             raise SystemExit(f"arm failed (rc={rc}): {err or out}")
@@ -577,6 +577,7 @@ class Registry:
                       file=sys.stderr)
                 self._log(pod_id, "artifactless-teardown", f"up {hrs:.1f}h, no remote_path")
         # ARTIFACT GUARANTEE: pull + verify before any kill (skipped only by force/skip_pull).
+        pull_verified = False
         if not skip_pull and not force and pod["remote_path"] and pod["local_path"]:
             ok, err = self.sync(pod_id)
             local = Path(pod["local_path"])
@@ -586,20 +587,31 @@ class Registry:
                     f"REFUSED: artifact pull/verify failed for {pod_id} "
                     f"(rsync_ok={ok}, local_nonempty={nonempty}). Pod left UP. "
                     f"Fix sync or use --force. ({err.strip()[:120]})")
+            pull_verified = True
         terminate_remote(pod_id)
         self.db.execute("UPDATE pods SET status='terminated', terminated_at=? WHERE pod_id=?",
                         (_ts(), pod_id))
         self.db.commit()
         self._log(pod_id, "force-teardown" if force else "teardown", f"was {pod['owner_label']}")
         # P-2: the ephemeral volume dies with the pod — nothing persists on RunPod.
-        self._delete_volume(pod)
+        # (Unless it holds unpulled artifacts — see the data guard in _delete_volume.)
+        self._delete_volume(pod, pull_verified=pull_verified)
         return True
 
-    def _delete_volume(self, pod):
+    def _delete_volume(self, pod, pull_verified=False):
         """Delete a pod's ephemeral network volume after teardown (P-1/P-2). Best-
-        effort but LOUD on failure — a leaked volume bills storage indefinitely."""
+        effort but LOUD on failure — a leaked volume bills storage indefinitely.
+        DATA GUARD (2026-07-05): if the pod declared artifacts (remote_path) and
+        this teardown did NOT verify a pull, the volume is the ONLY copy of the
+        data — keep it (it bills; sweep manually after rescuing the artifacts)."""
         vid = pod.get("volume_id")
         if not vid or pod.get("volume_deleted_at"):
+            return
+        if pod.get("remote_path") and not pull_verified and not pod.get("no_artifacts"):
+            print(f"# WARNING: keeping volume {vid} of {pod['pod_id']} — artifacts were "
+                  f"NOT pull-verified this teardown. Rescue the data, then "
+                  f"`podtrack sweep-volumes --force`.", file=sys.stderr)
+            self._log(pod["pod_id"], "volume-kept-unpulled", vid)
             return
         try:
             delete_network_volume(vid)
