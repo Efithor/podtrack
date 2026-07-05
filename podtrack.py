@@ -39,6 +39,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid as _uuid
@@ -50,6 +51,10 @@ DATA_DIR = Path(os.environ.get("PODTRACK_HOME", Path.home() / ".local/share/podt
 DB_PATH = DATA_DIR / "pods.db"
 CRED_DIR = Path.home() / ".config/podtrack"
 CRED_PATH = CRED_DIR / "runpod.key"
+# Restricted RunPod token planted in the on-pod dead-man switch (failure mode #4).
+# Prefer a token scoped as narrowly as the account allows (ideally podTerminate-
+# only) so a compromised/leaked pod can self-destruct but not touch the account.
+DEADMAN_TOKEN_PATH = CRED_DIR / "deadman.token"
 LEGACY_KEY = Path.home() / ".keys/runpod"
 RUNPOD_API = "https://api.runpod.io/graphql"
 SSH_KEYS = [Path.home() / ".runpod/ssh/RunPod-Key-Go",   # RunPod pods
@@ -67,6 +72,7 @@ def _ssh_key_for(pod) -> str:
     return str(SSH_KEYS[-1])
 LIVE_STATUSES = ("provisioning", "running", "exited")
 DEADMAN_SH = Path(__file__).with_name("deadman.sh")
+DEADMAN_SUP = Path(__file__).with_name("deadman_supervisor.sh")   # respawns the watchdog (#3)
 JOB_HB_FILE = "/root/.podtrack_job_alive"      # job writes ISO-UTC ts here; reaper reads it
 
 
@@ -136,12 +142,31 @@ def runpod_key() -> str:
     raise SystemExit(f"no RunPod key at {CRED_PATH}; run `podtrack adopt-key`.")
 
 
+def deadman_token(token_file: str | None = None) -> tuple[str, str]:
+    """Resolve the credential to plant in the on-pod dead-man switch (failure mode #4).
+
+    Order: explicit --token-file  >  restricted token at DEADMAN_TOKEN_PATH  >
+    (loud fallback) the full account key. The full key sitting plaintext in a
+    pod's /dev/shm is the failure we're closing: a restricted token means a
+    leaked pod can only terminate ITSELF, not the whole account. Returns
+    (secret, human-readable-source); callers WARN when the source is the full key."""
+    if token_file:
+        return Path(token_file).read_text().strip(), f"token-file {token_file}"
+    if DEADMAN_TOKEN_PATH.exists():
+        return DEADMAN_TOKEN_PATH.read_text().strip(), f"restricted token {DEADMAN_TOKEN_PATH}"
+    return runpod_key(), "FULL ACCOUNT KEY (no restricted token configured)"
+
+
 # ------------------------------------------------------------------ RunPod API
 def gql(query: str, variables: dict | None = None) -> dict:
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    # #15: send the key in an Authorization header, NOT the URL query string, so it
+    # can't leak into access logs / proxies / crash traces. RunPod accepts
+    # `Authorization: Bearer <key>` (confirmed 2026-07-05).
     req = urllib.request.Request(
-        f"{RUNPOD_API}?api_key={runpod_key()}", data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (podtrack)"})
+        RUNPOD_API, data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (podtrack)",
+                 "Authorization": f"Bearer {runpod_key()}"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             out = json.loads(r.read().decode())
@@ -181,6 +206,60 @@ def terminate_remote(pod_id: str):
     gql("mutation($i:PodTerminateInput!){podTerminate(input:$i)}", {"i": {"podId": pod_id}})
 
 
+# ---- ephemeral network-volume lifecycle (failure mode #10 / policy P-2) ----
+# Schema confirmed empirically against api.runpod.io 2026-07-05 (introspection is
+# disabled server-side; verified via query-validation probes):
+#   createNetworkVolume(input:{name,size,dataCenterId!}) -> NetworkVolume{id name size dataCenterId}
+#   deleteNetworkVolume(input:{id!})
+#   myself.networkVolumes{id name size dataCenterId}
+#   dataCenters{id storageSupport gpuAvailability{gpuTypeId available stockStatus}}
+EPH_VOLUME_PREFIX = "pt-eph-"      # names ephemeral, sweepable volumes (P-1 leak sweep)
+_STOCK_RANK = {"High": 3, "Medium": 2, "Low": 1, None: 0}
+
+
+def create_network_volume(name: str, size_gb: int, datacenter_id: str) -> dict:
+    q = ("mutation($i:CreateNetworkVolumeInput!){createNetworkVolume(input:$i)"
+         "{id name size dataCenterId}}")
+    return gql(q, {"i": {"name": name, "size": size_gb, "dataCenterId": datacenter_id}})["createNetworkVolume"]
+
+
+def delete_network_volume(volume_id: str) -> None:
+    gql("mutation($i:DeleteNetworkVolumeInput!){deleteNetworkVolume(input:$i)}",
+        {"i": {"id": volume_id}})
+
+
+def list_network_volumes() -> list[dict]:
+    return ((gql("query{myself{networkVolumes{id name size dataCenterId}}}").get("myself") or {})
+            .get("networkVolumes") or [])
+
+
+def datacenters_for_gpu(gpu_type_id: str) -> list[dict]:
+    """DCs that BOTH support network volumes AND currently have `gpu_type_id`
+    available, best-stock first. Resolves the datacenter oddity: the ephemeral
+    volume is created in a DC we then pin the pod to, so it can never silently
+    unmount. Returns [{'id','stock'}] ranked High>Medium>Low."""
+    q = ("query{dataCenters{id storageSupport "
+         "gpuAvailability{gpuTypeId available stockStatus}}}")
+    out = []
+    for dc in (gql(q).get("dataCenters") or []):
+        if not dc.get("storageSupport"):
+            continue
+        for ga in (dc.get("gpuAvailability") or []):
+            if ga.get("gpuTypeId") == gpu_type_id and ga.get("available"):
+                out.append({"id": dc["id"], "stock": ga.get("stockStatus"),
+                            "_rank": _STOCK_RANK.get(ga.get("stockStatus"), 0)})
+                break
+    out.sort(key=lambda d: -d["_rank"])
+    return out
+
+
+def pod_desired_status(pod_id: str) -> str | None:
+    """Live desiredStatus for a pod, or None if it's gone (confirmation signal)."""
+    q = "query($id:String!){pod(input:{podId:$id}){desiredStatus}}"
+    pod = gql(q, {"id": pod_id}).get("pod")
+    return (pod or {}).get("desiredStatus") if pod else None
+
+
 # ----------------------------------------------------------------- ssh helpers
 def _ssh_base(pod):
     return ["ssh", "-i", _ssh_key_for(pod), "-p", str(pod["ssh_port"]),
@@ -188,15 +267,28 @@ def _ssh_base(pod):
             f"{SSH_USER}@{pod['ssh_ip']}"]
 
 
-def ssh_run(pod, remote_cmd, timeout=60):
+def ssh_run(pod, remote_cmd, timeout=60, retries=2, warn=True):
+    """Run a command over SSH, treating transport failure as first-class (#14):
+    retry transient errors with backoff and surface a WARN. rc 255 == SSH
+    transport failure (unreachable); any other rc means the command actually ran."""
     if not pod.get("ssh_ip"):
         return 255, "", "no ssh endpoint in registry (run reconcile)"
-    try:
-        p = subprocess.run(_ssh_base(pod) + [remote_cmd],
-                           capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
-        return 255, "", "ssh timeout"
+    last = (255, "", "ssh transport error")
+    for attempt in range(1, retries + 1):
+        try:
+            p = subprocess.run(_ssh_base(pod) + [remote_cmd],
+                               capture_output=True, text=True, timeout=timeout)
+            if p.returncode != 255:          # command ran (even if it exited nonzero)
+                return p.returncode, p.stdout, p.stderr
+            last = (255, p.stdout, (p.stderr or "ssh transport error").strip())
+        except subprocess.TimeoutExpired:
+            last = (255, "", "ssh timeout")
+        if attempt < retries:
+            time.sleep(min(2 * attempt, 8))
+    if warn:
+        print(f"# WARN: ssh to {pod.get('pod_id')} @ {pod.get('ssh_ip')}:{pod.get('ssh_port')} "
+              f"failed after {retries} attempts: {last[2][:120]}", file=sys.stderr)
+    return last
 
 
 def rsync_pull(pod, remote_path, local_path, timeout=1800):
@@ -229,6 +321,13 @@ NEW_COLS = {
     "last_gpu_util": "INTEGER",
     "idle_strikes": "INTEGER DEFAULT 0",   # consecutive idle reconciles (sustained-idle gate)
     "ssh_key": "TEXT",                     # per-pod SSH key (RunPod vs home-box differ)
+    "volume_id": "TEXT",                   # ephemeral network volume attached to this pod (P-2)
+    "volume_deleted_at": "TEXT",           # set when the ephemeral volume is deleted at teardown
+    "deadman_verified_at": "TEXT",         # last time the on-pod watchdog was confirmed alive (#1)
+    "ssh_fail_streak": "INTEGER DEFAULT 0",  # consecutive reaps SSH was unreachable (#8/#14)
+    "vanish_strikes": "INTEGER DEFAULT 0",   # consecutive fetches a live pod was absent (#11 guard)
+    "kill_after_absolute": "TEXT",         # hard TTL cap that ignores heartbeats (#6)
+    "no_artifacts": "INTEGER DEFAULT 0",   # opt-out: short job with intentionally no artifacts (#9)
 }
 
 
@@ -275,21 +374,27 @@ class Registry:
 
     # ---- CRUD ----
     def register(self, pod_id, gpu_type=None, ssh_ip=None, ssh_port=None, cost_per_hr=None,
-                 status="running", remote_path=None, local_path=None, ssh_key=None, notes=None):
+                 status="running", remote_path=None, local_path=None, ssh_key=None,
+                 volume_id=None, no_artifacts=False, notes=None):
         self.db.execute(
             "INSERT INTO pods(pod_id,owner_uuid,owner_label,gpu_type,ssh_ip,ssh_port,status,"
-            "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,ssh_key,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,ssh_key,volume_id,"
+            "no_artifacts,notes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(pod_id) DO UPDATE SET owner_uuid=excluded.owner_uuid,"
             "owner_label=excluded.owner_label,gpu_type=COALESCE(excluded.gpu_type,gpu_type),"
             "ssh_ip=COALESCE(excluded.ssh_ip,ssh_ip),ssh_port=COALESCE(excluded.ssh_port,ssh_port),"
             "status=excluded.status,remote_path=COALESCE(excluded.remote_path,remote_path),"
             "local_path=COALESCE(excluded.local_path,local_path),"
-            "ssh_key=COALESCE(excluded.ssh_key,ssh_key)",
+            "ssh_key=COALESCE(excluded.ssh_key,ssh_key),"
+            "volume_id=COALESCE(excluded.volume_id,volume_id),"
+            "no_artifacts=excluded.no_artifacts",
             (pod_id, self.uuid, self.label, gpu_type, ssh_ip, ssh_port, status, cost_per_hr,
-             _ts(), _ts(), remote_path, local_path, ssh_key, notes))
+             _ts(), _ts(), remote_path, local_path, ssh_key, volume_id,
+             1 if no_artifacts else 0, notes))
         self.db.commit()
-        self._log(pod_id, "register", f"{self.label} gpu={gpu_type}")
+        self._log(pod_id, "register", f"{self.label} gpu={gpu_type}"
+                  + (f" vol={volume_id}" if volume_id else ""))
         return self.get(pod_id)
 
     def get(self, pod_id):
@@ -346,30 +451,87 @@ class Registry:
         return rc == 0, err
 
     # ---- dead-man switch ----
-    def arm(self, pod_id, kill_in_min, token_file=None):
-        """Plant an on-pod self-destruct that fires at now+kill_in_min unless petted."""
+    DEADMAN_DIR = "/dev/shm/podtrack"
+    # The SUPERVISOR is what guarantees a watchdog is present (it respawns
+    # deadman.sh if it dies), so it is the process we verify liveness against (#3).
+    DEADMAN_PROC = "/dev/shm/podtrack/deadman_supervisor.sh"
+
+    def _deadman_alive(self, pod) -> bool:
+        """Definitive check that the on-pod dead-man SUPERVISOR is running
+        (failure modes #1/#3: `arm` is fire-and-forget; a 'protected' pod may have no
+        watchdog after a silent launch failure, pod restart, or OOM). The supervisor
+        keeps deadman.sh respawned, so its presence == a live watchdog.
+        ⚠ The pattern MUST be bracketed: a plain `pgrep -f <path>` over SSH matches
+        the remote `bash -c` wrapper's own cmdline (which contains the pattern) and
+        reports ALIVE unconditionally — silently defeating the verification."""
+        rc, out, _ = ssh_run(
+            pod, "pgrep -f '[d]eadman_supervisor[.]sh' >/dev/null && echo ALIVE || echo DEAD",
+            timeout=20)
+        return rc == 0 and "ALIVE" in out
+
+    def _launch_deadman(self, pod):
+        return ssh_run(
+            pod, f"setsid nohup {self.DEADMAN_PROC} "
+                 f">{self.DEADMAN_DIR}/supervisor.log 2>&1 &", timeout=20)
+
+    def arm(self, pod_id, kill_in_min, token_file=None, kill_absolute_min=None):
+        """Plant an on-pod self-destruct that fires at now+kill_in_min unless petted,
+        then VERIFY the watchdog is actually alive before claiming the pod is
+        protected (failure mode #1). Uses a restricted token by default (#4).
+        `kill_absolute_min` sets a HARD cap (`kill_after_absolute`) the reaper honors
+        even if the job is heartbeating (#6) — the soft deadline can be petted, the
+        absolute one cannot."""
         pod = self.get(pod_id)
         if not pod:
             raise SystemExit(f"{pod_id} not in registry")
         deadline = _now() + timedelta(minutes=kill_in_min)
-        key = Path(token_file).read_text().strip() if token_file else runpod_key()
+        abs_deadline = (_now() + timedelta(minutes=kill_absolute_min)
+                        if kill_absolute_min else None)
+        key, key_src = deadman_token(token_file)
+        if "FULL ACCOUNT KEY" in key_src:
+            print(f"# WARNING: arming {pod_id} with the FULL RunPod account key in the pod's "
+                  f"/dev/shm. Prefer a restricted token — drop one at {DEADMAN_TOKEN_PATH} "
+                  f"(scoped to podTerminate). See README (dead-man credential).", file=sys.stderr)
+        else:
+            print(f"# arm: dead-man credential = {key_src}", file=sys.stderr)
         script = DEADMAN_SH.read_text()
-        # install: drop key to tmpfs, write deadline, launch detached watchdog
+        supervisor = DEADMAN_SUP.read_text()
+        # install: drop key to tmpfs, write deadline + both scripts, launch the
+        # SUPERVISOR detached (it keeps deadman.sh respawned — #3).
         rc, out, err = ssh_run(pod, (
             f"mkdir -p /dev/shm/podtrack && umask 077 && "
             f"printf '%s' '{key}' > /dev/shm/podtrack/rpk && "
             f"printf '%s' '{pod_id}' > /dev/shm/podtrack/pod_id && "
             f"printf '%s' '{_ts(deadline)}' > /dev/shm/podtrack/deadline && "
             f"cat > /dev/shm/podtrack/deadman.sh <<'PTEOF'\n{script}\nPTEOF\n"
-            f"chmod +x /dev/shm/podtrack/deadman.sh && "
-            f"setsid nohup /dev/shm/podtrack/deadman.sh >/dev/shm/podtrack/deadman.log 2>&1 &"
+            f"cat > /dev/shm/podtrack/deadman_supervisor.sh <<'PTSUP'\n{supervisor}\nPTSUP\n"
+            f"chmod +x /dev/shm/podtrack/deadman.sh /dev/shm/podtrack/deadman_supervisor.sh && "
+            f"setsid nohup /dev/shm/podtrack/deadman_supervisor.sh "
+            f">/dev/shm/podtrack/supervisor.log 2>&1 &"
         ), timeout=40)
         if rc != 0:
             raise SystemExit(f"arm failed (rc={rc}): {err or out}")
-        self.db.execute("UPDATE pods SET kill_after=?,deadman=1 WHERE pod_id=?",
-                        (_ts(deadline), pod_id))
+        # VERIFY (#1): the watchdog must actually be running, else this pod is
+        # unprotected despite deadman=1. One relaunch attempt, then hard-fail.
+        alive = self._deadman_alive(pod)
+        if not alive:
+            self._launch_deadman(pod)
+            alive = self._deadman_alive(pod)
+        if not alive:
+            raise SystemExit(
+                f"arm: dead-man watchdog failed to start on {pod_id} (pgrep found "
+                f"no {self.DEADMAN_PROC}). Pod is NOT protected — investigate the pod.")
+        # Preserve any existing absolute cap on re-arm (reap calls arm() without it).
+        if abs_deadline is not None:
+            self.db.execute("UPDATE pods SET kill_after=?,kill_after_absolute=?,deadman=1,"
+                            "deadman_verified_at=? WHERE pod_id=?",
+                            (_ts(deadline), _ts(abs_deadline), _ts(), pod_id))
+        else:
+            self.db.execute("UPDATE pods SET kill_after=?,deadman=1,deadman_verified_at=? "
+                            "WHERE pod_id=?", (_ts(deadline), _ts(), pod_id))
         self.db.commit()
-        self._log(pod_id, "arm", f"deadman fires {_ts(deadline)}")
+        self._log(pod_id, "arm", f"deadman fires {_ts(deadline)} (verified alive)"
+                  + (f" abs-cap {_ts(abs_deadline)}" if abs_deadline else ""))
         return _ts(deadline)
 
     def pet(self, pod_id, extend_min):
@@ -402,6 +564,18 @@ class Registry:
                 f"not you ('{self.label}'). Use --force only if certain, or `claim` it first.")
         if not as_reaper:
             self._maybe_reclaim(pod)
+        # #9: a long-lived pod with NO artifact spec is almost certainly a mistake
+        # (P-2 gives every >1 h job a remote_path). Warn loudly; short jobs silence
+        # it with `register --no-artifacts`. Skipped for --force/--skip-pull kills.
+        if not skip_pull and not force and not pod["remote_path"] and not pod["no_artifacts"]:
+            dep = _parse(pod["deployed_at"])
+            if dep and (_now() - dep) > timedelta(hours=1):
+                hrs = (_now() - dep).total_seconds() / 3600
+                print(f"# WARN: tearing down {pod_id} (up {hrs:.1f}h) with NO artifact spec "
+                      f"— any outputs are NOT being pulled and will be lost. Set "
+                      f"--remote-path/--local-path, or `register --no-artifacts` to silence.",
+                      file=sys.stderr)
+                self._log(pod_id, "artifactless-teardown", f"up {hrs:.1f}h, no remote_path")
         # ARTIFACT GUARANTEE: pull + verify before any kill (skipped only by force/skip_pull).
         if not skip_pull and not force and pod["remote_path"] and pod["local_path"]:
             ok, err = self.sync(pod_id)
@@ -417,7 +591,54 @@ class Registry:
                         (_ts(), pod_id))
         self.db.commit()
         self._log(pod_id, "force-teardown" if force else "teardown", f"was {pod['owner_label']}")
+        # P-2: the ephemeral volume dies with the pod — nothing persists on RunPod.
+        self._delete_volume(pod)
         return True
+
+    def _delete_volume(self, pod):
+        """Delete a pod's ephemeral network volume after teardown (P-1/P-2). Best-
+        effort but LOUD on failure — a leaked volume bills storage indefinitely."""
+        vid = pod.get("volume_id")
+        if not vid or pod.get("volume_deleted_at"):
+            return
+        try:
+            delete_network_volume(vid)
+            self.db.execute("UPDATE pods SET volume_deleted_at=? WHERE pod_id=?",
+                            (_ts(), pod["pod_id"]))
+            self.db.commit()
+            self._log(pod["pod_id"], "volume-delete", vid)
+        except SystemExit as e:
+            print(f"# WARNING: failed to delete ephemeral volume {vid} for {pod['pod_id']}: "
+                  f"{str(e)[:160]}. It will bill storage until swept "
+                  f"(`podtrack sweep-volumes`).", file=sys.stderr)
+            self._log(pod["pod_id"], "volume-delete-failed", f"{vid}: {str(e)[:120]}")
+
+    def sweep_volumes(self, force=False):
+        """Leak sweep (P-1 enforcement): delete ephemeral `pt-eph-*` volumes not
+        referenced by any live pod in the registry. Volumes unknown to the
+        registry are only deleted with force=True (a fresh volume mid-deploy is
+        briefly unknown — avoid racing it). Returns (deleted, skipped)."""
+        live_vids = {p["volume_id"] for p in self.list_pods("all")
+                     if p.get("volume_id") and p["status"] in LIVE_STATUSES}
+        known_vids = {p["volume_id"] for p in self.list_pods("all") if p.get("volume_id")}
+        deleted, skipped = [], []
+        for v in list_network_volumes():
+            if not (v.get("name") or "").startswith(EPH_VOLUME_PREFIX):
+                continue
+            vid = v["id"]
+            if vid in live_vids:
+                skipped.append((vid, "attached to live pod"))
+                continue
+            if vid not in known_vids and not force:
+                skipped.append((vid, "unknown to registry (use --force)"))
+                continue
+            try:
+                delete_network_volume(vid)
+                deleted.append(vid)
+                self._log(vid, "volume-sweep", v.get("name", ""))
+            except SystemExit as e:
+                skipped.append((vid, f"delete failed: {str(e)[:80]}"))
+        return deleted, skipped
 
     # ---- reconcile ----
     def reconcile(self, terminate_untracked=False):
@@ -433,7 +654,7 @@ class Registry:
                 self.db.execute(
                     "UPDATE pods SET status=?,gpu_type=COALESCE(?,gpu_type),cost_per_hr=?,"
                     "ssh_ip=COALESCE(?,ssh_ip),ssh_port=COALESCE(?,ssh_port),"
-                    "last_gpu_util=?,gpu_verified_at=? WHERE pod_id=?",
+                    "last_gpu_util=?,gpu_verified_at=?,vanish_strikes=0 WHERE pod_id=?",
                     ("running" if running else "exited", rp["gpu_type"], rp["cost_per_hr"],
                      rp["ssh_ip"], rp["ssh_port"], rp["gpu_util"],
                      _ts() if rp["n_gpus"] else None, pid))
@@ -446,11 +667,27 @@ class Registry:
                      "untracked", rp["cost_per_hr"], _ts(), "discovered by reconcile"))
                 s["untracked"].append(pid)
                 self._log(pid, "reconcile", "found untracked/leaked pod")
-        for pid, kp in known.items():
-            if pid not in remote and kp["status"] in LIVE_STATUSES:
-                self.db.execute("UPDATE pods SET status='terminated',terminated_at=? "
-                                "WHERE pod_id=?", (_ts(), pid))
-                s["vanished"].append(pid)
+        # #11 vanished-guard: a truncated/partial fetch must not mark live pods gone
+        # (that hides a still-billing pod as an un-reapable "terminated" leak).
+        known_live = [k for k in known.values() if k["status"] in LIVE_STATUSES]
+        if not remote and known_live:
+            # 0 pods returned while we believe some are live -> almost certainly a
+            # failed/truncated fetch, not a mass termination. Skip the sweep entirely.
+            print(f"# WARN: RunPod returned 0 pods but registry has {len(known_live)} live; "
+                  f"skipping vanish sweep this cycle (likely a partial/failed fetch).",
+                  file=sys.stderr)
+        else:
+            for pid, kp in known.items():
+                if pid in remote or kp["status"] not in LIVE_STATUSES:
+                    continue
+                vs = (kp["vanish_strikes"] or 0) + 1
+                if vs >= 2:                     # confirmed absent across 2 consecutive fetches
+                    self.db.execute("UPDATE pods SET status='terminated',terminated_at=?,"
+                                    "vanish_strikes=0 WHERE pod_id=?", (_ts(), pid))
+                    s["vanished"].append(pid)
+                else:
+                    self.db.execute("UPDATE pods SET vanish_strikes=? WHERE pod_id=?", (vs, pid))
+                    self._log(pid, "vanish-strike", f"{vs}/2 (absent this fetch)")
         self.db.commit()
         if terminate_untracked:
             for pid in s["untracked"]:
@@ -463,9 +700,11 @@ class Registry:
         self.db.execute("UPDATE pods SET last_job_heartbeat=? WHERE pod_id=?", (_ts(), pod_id))
         self.db.commit()
 
-    def _read_remote_heartbeat(self, pod):
+    def _read_remote_heartbeat(self, pod) -> bool:
         """Best-effort: pull the job's heartbeat file (ISO-UTC ts) from the pod via SSH.
-        Jobs keep it fresh with e.g. `while :; do date -u +%FT%TZ > JOB_HB_FILE; sleep 60; done`."""
+        Jobs keep it fresh with e.g. `while :; do date -u +%FT%TZ > JOB_HB_FILE; sleep 60; done`.
+        Returns whether the pod was SSH-REACHABLE (rc 255 == transport failure), so the
+        reaper can track an unreachable streak (#8) independent of whether a hb file exists."""
         rc, out, _ = ssh_run(pod, f"cat {JOB_HB_FILE} 2>/dev/null", timeout=20)
         ts = out.strip()
         if rc == 0 and ts:
@@ -476,55 +715,138 @@ class Registry:
                 self.db.commit()
             except Exception:
                 pass
+        return rc != 255                        # reachable if SSH transport worked at all
 
     # ---- autonomous reaper (run by the systemd timer) ----
     def reap(self, mirror=True, pet_min=30, startup_grace_min=15,
-             idle_strikes_needed=3, hb_grace_min=20):
+             idle_strikes_needed=3, hb_grace_min=20,
+             unreachable_reaps_needed=3, untracked_grace_min=30):
         """Autonomous: reconcile -> mirror -> pet healthy -> safe-teardown TTL/idle pods.
 
         v0.2.1 safety (a momentary 0%-GPU snapshot no longer kills an active pod):
           - startup grace: never idle-kill a pod younger than `startup_grace_min`.
           - SUSTAINED idle: idle-kill needs `idle_strikes_needed` CONSECUTIVE idle
             reconciles (busy GPU resets the counter), not a single snapshot.
-          - heartbeat override: a fresh job heartbeat (< `hb_grace_min`) blocks idle-kill.
-        A hard `kill_after` TTL still fires regardless (the owner set it deliberately)."""
+        v0.3 (Phase 1):
+          - #7 heartbeat-PRIMARY: a fresh job heartbeat (< `hb_grace_min`) means
+            "working" — it resets idle strikes and blocks idle-kill outright.
+          - #6 TTL grace: a soft `kill_after` that hits while a heartbeat is fresh is
+            EXTENDED once (pet) with a warning, not insta-killed. Only `kill_after_
+            absolute` (or a stale heartbeat) forces the kill.
+          - #8 unreachable-escalation: an idle pod SSH-unreachable for
+            `unreachable_reaps_needed` reaps past startup grace is force-terminated
+            (a leak that can never otherwise be reaped; mirror already ran while
+            reachable and the ephemeral volume shrinks the blast radius).
+          - #12 untracked auto-reap: pods on the account but in no tracked session are
+            terminated once older than `untracked_grace_min`.
+          - #14 SSH failures are first-class (retry+WARN); a busy pod we can't pet is
+            surfaced loudly rather than left to drift into a dead-man kill."""
         recon = self.reconcile()
-        report = {"reaped": [], "petted": [], "mirrored": [], "kept": [], **recon}
+        report = {"reaped": [], "petted": [], "rearmed": [], "mirrored": [], "kept": [], **recon}
         now = _now()
+
+        # #12: auto-terminate untracked pods (owner UNKNOWN) older than the grace.
         for pod in self.list_pods("all"):
-            if pod["status"] != "running":
+            if pod["owner_uuid"] != "UNKNOWN" or pod["status"] not in LIVE_STATUSES + ("untracked",):
                 continue
+            pid = pod["pod_id"]
+            dep = _parse(pod["deployed_at"])
+            if dep is None or (now - dep) < timedelta(minutes=untracked_grace_min):
+                report["kept"].append((pid, "untracked (within grace)"))
+                continue
+            try:
+                self.teardown(pid, force=True, skip_pull=True)   # no artifact spec to pull
+                report["reaped"].append((pid, "untracked"))
+            except SystemExit as e:
+                report["kept"].append((pid, f"untracked-refused: {str(e)[:50]}"))
+
+        for pod in self.list_pods("all"):
+            if pod["status"] != "running" or pod["owner_uuid"] == "UNKNOWN":
+                continue                          # untracked handled above
             pid = pod["pod_id"]
             if mirror and pod["remote_path"]:
                 ok, _ = self.sync(pid)
                 if ok:
                     report["mirrored"].append(pid)
-            self._read_remote_heartbeat(pod)
-            pod = self.get(pid)                                  # reload after hb/strike updates
-            # sustained-idle accounting
-            gpu_idle_now = pid in recon["idle_or_cpu"]
-            strikes = (pod["idle_strikes"] or 0) + 1 if gpu_idle_now else 0
-            self.db.execute("UPDATE pods SET idle_strikes=? WHERE pod_id=?", (strikes, pid))
+            reachable = self._read_remote_heartbeat(pod)
+            sfs = 0 if reachable else (pod["ssh_fail_streak"] or 0) + 1
+            self.db.execute("UPDATE pods SET ssh_fail_streak=? WHERE pod_id=?", (sfs, pid))
             self.db.commit()
-            # decision
+            pod = self.get(pid)                                  # reload after hb/streak updates
+
+            gpu_idle_now = pid in recon["idle_or_cpu"]
             dep = _parse(pod["deployed_at"])
             young = dep is not None and (now - dep) < timedelta(minutes=startup_grace_min)
             hb = _parse(pod["last_job_heartbeat"])
             fresh_hb = hb is not None and (now - hb) < timedelta(minutes=hb_grace_min)
+            # #7 heartbeat-primary: a working job zeroes idle strikes regardless of a
+            # transient GPU-util dip; only a pod WITHOUT a fresh heartbeat accrues them.
+            strikes = 0 if fresh_hb else ((pod["idle_strikes"] or 0) + 1 if gpu_idle_now else 0)
+            self.db.execute("UPDATE pods SET idle_strikes=? WHERE pod_id=?", (strikes, pid))
+            self.db.commit()
+
+            # #8 unreachable-escalation: idle + SSH-dead for N reaps past grace = leak.
+            if sfs >= unreachable_reaps_needed and gpu_idle_now and not young and not fresh_hb:
+                print(f"# ALERT: {pid} idle AND SSH-unreachable for {sfs} reaps — "
+                      f"force-terminating (un-reapable leak; last mirror was while reachable).",
+                      file=sys.stderr)
+                try:
+                    self.teardown(pid, force=True, skip_pull=True)
+                    report["reaped"].append((pid, f"unreachable x{sfs}+idle"))
+                except SystemExit as e:
+                    report["kept"].append((pid, f"unreachable-refused: {str(e)[:50]}"))
+                continue
+
+            abs_expired = pod["kill_after_absolute"] and now > _parse(pod["kill_after_absolute"])
             ttl_expired = pod["kill_after"] and now > _parse(pod["kill_after"])
-            idle_kill = (strikes >= idle_strikes_needed) and not young and not fresh_hb
-            if ttl_expired or idle_kill:
+            idle_kill = (strikes >= idle_strikes_needed) and not young
+
+            # #6 TTL grace: soft TTL + fresh heartbeat => extend once, don't kill.
+            if ttl_expired and not abs_expired and fresh_hb:
+                if self.pet(pid, pet_min):
+                    print(f"# WARN: {pid} hit soft TTL but a heartbeat is fresh; extended "
+                          f"+{pet_min}m instead of killing. Use kill_after_absolute for a "
+                          f"hard cap.", file=sys.stderr)
+                    self._log(pid, "ttl-grace", f"soft TTL + fresh hb -> +{pet_min}m")
+                    report["petted"].append(pid)
+                else:                              # #14: busy but we can't pet — alarm, don't drift
+                    print(f"# ALERT: {pid} busy (fresh hb) hit soft TTL but pet FAILED (ssh "
+                          f"down). The on-pod dead-man may kill it at {pod['kill_after']}. "
+                          f"Investigate.", file=sys.stderr)
+                    report["kept"].append((pid, "ttl-grace pet FAILED (busy, unreachable)"))
+                continue
+
+            hard_kill = abs_expired or ttl_expired or idle_kill
+            reason = ("abs-ttl" if abs_expired else "ttl" if ttl_expired else f"idle x{strikes}")
+            if hard_kill:
                 try:
                     self.teardown(pid, as_reaper=True)          # bypass ownership; keep pull-verify
-                    report["reaped"].append((pid, "ttl" if ttl_expired else f"idle x{strikes}"))
+                    report["reaped"].append((pid, reason))
                 except SystemExit as e:
                     report["kept"].append((pid, f"refused: {str(e)[:60]}"))
             elif pod["deadman"]:
-                self.pet(pid, pet_min)
-                report["petted"].append(pid)
+                # #1/#3: a watchdog is RAM-only — a pod restart/OOM wipes it, leaving
+                # deadman=1 but no process. Verify each reap; re-arm to the remaining
+                # TTL if it vanished, otherwise pet it forward.
+                if self._deadman_alive(pod):
+                    self.db.execute("UPDATE pods SET deadman_verified_at=? WHERE pod_id=?",
+                                    (_ts(), pid))
+                    self.db.commit()
+                    if not self.pet(pid, pet_min) and fresh_hb:
+                        print(f"# ALERT: {pid} busy but pet FAILED (ssh down); its dead-man "
+                              f"deadline is no longer sliding. Investigate.", file=sys.stderr)
+                    report["petted"].append(pid)
+                else:
+                    ka = _parse(pod["kill_after"])
+                    remaining = max(1, int((ka - now).total_seconds() // 60)) if ka else pet_min
+                    try:
+                        self.arm(pid, remaining)          # re-plant + re-verify watchdog
+                        report["rearmed"].append(pid)
+                    except SystemExit as e:
+                        report["kept"].append((pid, f"rearm-failed: {str(e)[:60]}"))
             else:
                 report["kept"].append(
-                    (pid, f"strikes={strikes} young={young} fresh_hb={bool(fresh_hb)}"))
+                    (pid, f"strikes={strikes} young={young} fresh_hb={bool(fresh_hb)} ssh_fail={sfs}"))
         return report
 
 
@@ -549,6 +871,9 @@ def main():
     for f in ("--label", "--gpu", "--ssh-ip", "--remote-path", "--local-path", "--ssh-key"):
         r.add_argument(f)
     r.add_argument("--ssh-port", type=int); r.add_argument("--cost", type=float)
+    r.add_argument("--volume-id", help="ephemeral network volume attached to this pod (P-2)")
+    r.add_argument("--no-artifacts", action="store_true",
+                   help="declare this pod produces no artifacts (silences the #9 teardown warn)")
     jh = sub.add_parser("job-heartbeat"); jh.add_argument("pod_id")
     li = sub.add_parser("list"); gg = li.add_mutually_exclusive_group()
     for fl in ("all", "mine", "others"):
@@ -558,17 +883,26 @@ def main():
     sy = sub.add_parser("sync"); sy.add_argument("pod_id")
     hb = sub.add_parser("heartbeat"); hb.add_argument("pod_id")
     am = sub.add_parser("arm"); am.add_argument("pod_id")
-    am.add_argument("--kill-in", type=int, required=True, help="minutes until self-destruct")
+    am.add_argument("--kill-in", type=int, required=True, help="minutes until self-destruct (soft, pettable)")
+    am.add_argument("--kill-absolute-min", type=int,
+                    help="minutes until a HARD cap the reaper honors even while heartbeating (#6)")
     am.add_argument("--token-file", help="restricted RunPod token for the on-pod switch")
     pt = sub.add_parser("pet"); pt.add_argument("pod_id"); pt.add_argument("--min", type=int, default=30)
     td = sub.add_parser("teardown"); td.add_argument("pod_id")
     td.add_argument("--force", action="store_true"); td.add_argument("--skip-pull", action="store_true")
     rc = sub.add_parser("reconcile"); rc.add_argument("--terminate-untracked", action="store_true")
+    sv = sub.add_parser("sweep-volumes")
+    sv.add_argument("--force", action="store_true",
+                    help="also delete pt-eph-* volumes unknown to the registry")
     rp = sub.add_parser("reap"); rp.add_argument("--no-mirror", action="store_true")
     rp.add_argument("--startup-grace", type=int, help="min; env PODTRACK_STARTUP_GRACE_MIN (15)")
     rp.add_argument("--idle-strikes", type=int, help="consecutive idle reconciles; env PODTRACK_IDLE_STRIKES (3)")
     rp.add_argument("--hb-grace", type=int, help="min; env PODTRACK_HB_GRACE_MIN (20)")
     rp.add_argument("--pet-min", type=int, help="min; env PODTRACK_PET_MIN (30)")
+    rp.add_argument("--unreachable-reaps", type=int,
+                    help="idle+SSH-dead reaps before force-kill; env PODTRACK_UNREACHABLE_REAPS (3)")
+    rp.add_argument("--untracked-grace", type=int,
+                    help="min before an untracked pod is auto-reaped; env PODTRACK_UNTRACKED_GRACE_MIN (30)")
     a = ap.parse_args()
 
     if a.cmd == "adopt-key":
@@ -579,7 +913,7 @@ def main():
     if a.cmd == "register":
         p = reg.register(a.pod_id, gpu_type=a.gpu, ssh_ip=a.ssh_ip, ssh_port=a.ssh_port,
                          cost_per_hr=a.cost, remote_path=a.remote_path, local_path=a.local_path,
-                         ssh_key=a.ssh_key)
+                         ssh_key=a.ssh_key, volume_id=a.volume_id, no_artifacts=a.no_artifacts)
         print(f"registered {p['pod_id']} -> '{p['owner_label']}'")
     elif a.cmd == "job-heartbeat":
         reg.job_heartbeat(a.pod_id); print(f"job-heartbeat {a.pod_id}")
@@ -594,7 +928,8 @@ def main():
     elif a.cmd == "heartbeat":
         reg.heartbeat(a.pod_id); print(f"heartbeat {a.pod_id}")
     elif a.cmd == "arm":
-        d = reg.arm(a.pod_id, a.kill_in, token_file=a.token_file)
+        d = reg.arm(a.pod_id, a.kill_in, token_file=a.token_file,
+                    kill_absolute_min=a.kill_absolute_min)
         print(f"armed {a.pod_id}: dead-man fires {d}")
     elif a.cmd == "pet":
         print("petted" if reg.pet(a.pod_id, a.min) else "pet failed")
@@ -604,15 +939,21 @@ def main():
         s = reg.reconcile(terminate_untracked=a.terminate_untracked)
         print(f"live={len(s['live'])} untracked={s['untracked']} vanished={s['vanished']} "
               f"idle_or_cpu={s['idle_or_cpu']}")
+    elif a.cmd == "sweep-volumes":
+        deleted, skipped = reg.sweep_volumes(force=a.force)
+        print(f"deleted={deleted} skipped={skipped}")
     elif a.cmd == "reap":
         rep = reg.reap(
             mirror=not a.no_mirror,
             startup_grace_min=_cfg(a.startup_grace, "PODTRACK_STARTUP_GRACE_MIN", 15),
             idle_strikes_needed=_cfg(a.idle_strikes, "PODTRACK_IDLE_STRIKES", 3),
             hb_grace_min=_cfg(a.hb_grace, "PODTRACK_HB_GRACE_MIN", 20),
-            pet_min=_cfg(a.pet_min, "PODTRACK_PET_MIN", 30))
-        print(f"reaped={rep['reaped']} petted={rep['petted']} mirrored={len(rep['mirrored'])} "
-              f"untracked={rep['untracked']} kept={len(rep['kept'])}")
+            pet_min=_cfg(a.pet_min, "PODTRACK_PET_MIN", 30),
+            unreachable_reaps_needed=_cfg(a.unreachable_reaps, "PODTRACK_UNREACHABLE_REAPS", 3),
+            untracked_grace_min=_cfg(a.untracked_grace, "PODTRACK_UNTRACKED_GRACE_MIN", 30))
+        print(f"reaped={rep['reaped']} petted={rep['petted']} rearmed={rep['rearmed']} "
+              f"mirrored={len(rep['mirrored'])} untracked={rep['untracked']} "
+              f"kept={len(rep['kept'])}")
 
 
 if __name__ == "__main__":
