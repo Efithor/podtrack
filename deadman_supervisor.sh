@@ -4,7 +4,7 @@
 # The watchdog (deadman.sh) is a single unsupervised process holding only RAM
 # state. If it is OOM-killed or crashes while the pod itself stays up, the pod
 # becomes silently unprotected until the home reaper notices and re-arms (up to
-# one reap cycle later — and the reaper only runs while the home box is awake).
+# one reap cycle later — and the reaper only runs while the host machine is awake).
 #
 # This supervisor closes that window from inside the pod: it respawns deadman.sh
 # whenever it exits, for as long as the deadline state survives. It deliberately

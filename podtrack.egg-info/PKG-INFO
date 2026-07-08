@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: podtrack
-Version: 0.1.0
-Summary: Ownership-aware RunPod pod registry for agent streams
-Requires-Python: >=3.9

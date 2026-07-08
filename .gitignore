@@ -3,3 +3,8 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# build artifacts
+*.egg-info/
+build/
+dist/

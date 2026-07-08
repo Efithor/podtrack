@@ -3,7 +3,7 @@
 #
 # Self-terminates the pod once the deadline passes, UNLESS the deadline file
 # keeps getting pushed forward (the local reaper "pets" it while the job is
-# healthy). Default-to-death: if the home machine goes dark and stops petting,
+# healthy). Default-to-death: if the host machine goes dark and stops petting,
 # the pod kills itself at its last deadline, bounding the GPU bill. Artifacts
 # survive on the RunPod network volume regardless.
 #

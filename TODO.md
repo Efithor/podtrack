@@ -44,5 +44,5 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
 - [ ] Registry `terminate_after` column mirroring the RunPod-side TTL set at
   deploy, so `list` shows the true outermost backstop.
 - [ ] Live-fire test of an actual dead-man FIRE (let a throwaway cheap pod's
-  deadline lapse with the home box "asleep" and confirm terminate + confirm-gone
+  deadline lapse with the host machine "asleep" and confirm terminate + confirm-gone
   loop + volume survival).

@@ -1,8 +1,26 @@
 [project]
 name = "podtrack"
-version = "0.1.0"
-description = "Ownership-aware RunPod pod registry for agent streams"
+version = "0.3.0"
+description = "Ownership-aware RunPod pod registry and autonomous reaper for shared accounts"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
+authors = [{ name = "Efithor", email = "efithor@gmail.com" }]
+keywords = ["runpod", "gpu", "cost-control", "infrastructure", "reaper"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/Efithor/podtrack"
+Repository = "https://github.com/Efithor/podtrack"
+Issues = "https://github.com/Efithor/podtrack/issues"
 
 [project.scripts]
 podtrack = "podtrack:main"

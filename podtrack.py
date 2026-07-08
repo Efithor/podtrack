@@ -3,30 +3,30 @@
 
 Why this exists
 ---------------
-Multiple agent streams (Claude Code sessions) share one RunPod account. Without
-ownership they clobber each other's pods (lost/orphaned -> silent billing), tear
-down each other's live pods, and leave idle/CPU pods running for hours. podtrack
-replaces the old single `pod_state.json` with a concurrency-safe SQLite registry
-that records WHO owns each pod, refuses cross-owner teardowns, and autonomously
-reaps idle/expired pods WITHOUT losing artifacts.
+Several independent workers share one RunPod account. Without ownership they
+clobber each other's pods (lost/orphaned -> silent billing), tear down each
+other's live pods, and leave idle/CPU pods running for hours. podtrack replaces
+a single unlocked JSON state file with a concurrency-safe SQLite registry that
+records WHO owns each pod, refuses cross-owner teardowns, and autonomously reaps
+idle/expired pods WITHOUT losing artifacts.
 
-v0.2 capabilities
------------------
-1. Registry        — one row per pod, shared across streams (SQLite, WAL).
-2. Ownership       — owner = (session-UUID, friendly-label). Continuity follows the
-                     LABEL (UUID is ephemeral across /resume); teardown is guarded.
+Capabilities
+------------
+1. Registry        — one row per pod, shared across workers (SQLite, WAL).
+2. Ownership       — owner = (uuid, friendly-label). Continuity follows the LABEL
+                     (the uuid is ephemeral across restarts); teardown is guarded.
 3. Reconcile       — diff registry vs live RunPod; catch leaks, mark vanished,
                      flag GPU-vs-CPU / idle.
 4. Artifact safety — every teardown is pull -> verify -> kill; a periodic mirror
                      bounds loss on ungraceful death. Artifacts live on the RunPod
                      network volume so any kill is data-safe.
-5. Autonomous reap — `reap` (run by a local systemd timer) reconciles, mirrors,
-                     pets healthy pods' dead-man switch, and safe-tears-down
+5. Autonomous reap — `reap` (run by a systemd timer) reconciles, mirrors, pets
+                     healthy pods' dead-man switch, and safe-tears-down
                      TTL-expired / idle pods.
 6. Dead-man switch — `arm` plants an on-pod self-destruct (default-to-death) so a
-                     pod self-terminates at its deadline even if the home machine
-                     is asleep. The local reaper "pets" it (slides the deadline)
-                     while a job is healthy.
+                     pod self-terminates at its deadline even if the host machine
+                     is asleep. The reaper "pets" it (slides the deadline) while a
+                     job is healthy.
 
 Credential mandate: podtrack is custodian of the RunPod key (`adopt-key`).
 """
@@ -58,7 +58,7 @@ DEADMAN_TOKEN_PATH = CRED_DIR / "deadman.token"
 LEGACY_KEY = Path.home() / ".keys/runpod"
 RUNPOD_API = "https://api.runpod.io/graphql"
 SSH_KEYS = [Path.home() / ".runpod/ssh/RunPod-Key-Go",   # RunPod pods
-            Path.home() / ".ssh/id_ed25519"]             # home box / generic
+            Path.home() / ".ssh/id_ed25519"]             # generic fallback
 SSH_USER = "root"                              # RunPod direct-SSH user
 
 
@@ -100,8 +100,9 @@ def _cfg(cli_val, env_name, default) -> int:
 
 # ----------------------------------------------------------------------- identity
 def whoami(uuid: str | None = None, label: str | None = None) -> tuple[str, str]:
-    """Resolve (owner_uuid, owner_label). UUID is ephemeral (changes across
-    /resume); LABEL is the stable task identity that ownership continuity follows."""
+    """Resolve (owner_uuid, owner_label). The uuid is ephemeral (changes across
+    restarts); LABEL is the stable task identity that ownership continuity follows.
+    CLAUDE_SESSION_ID is read as an optional fallback for agent-runner setups."""
     u = uuid or os.environ.get("PODTRACK_OWNER_UUID") or os.environ.get("CLAUDE_SESSION_ID")
     if not u:
         marker = DATA_DIR / "owner_id"
@@ -111,8 +112,8 @@ def whoami(uuid: str | None = None, label: str | None = None) -> tuple[str, str]
             u = f"host-{socket.gethostname()}-{_uuid.uuid4().hex[:8]}"
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             marker.write_text(u)
-        print(f"# podtrack: no session UUID in env; using fallback '{u}'. "
-              f"Set PODTRACK_OWNER_UUID + PODTRACK_LABEL to distinguish streams.",
+        print(f"# podtrack: no owner uuid in env; using fallback '{u}'. "
+              f"Set PODTRACK_OWNER_UUID + PODTRACK_LABEL to distinguish workers.",
               file=sys.stderr)
     return u, (label or os.environ.get("PODTRACK_LABEL") or "(unlabeled)")
 
