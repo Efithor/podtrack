@@ -9,21 +9,6 @@ It's built for anyone who launches RunPod pods from automation — CI jobs, batc
 pipelines, or multiple concurrent sessions against a single account — where "who owns
 this pod" and "is anything still using it" are easy to lose track of.
 
-## The problem
-
-A naive setup tracks pods in a single JSON file with no ownership and no locking.
-Run more than one worker against it and three things go wrong:
-
-- **Lost pods** — one worker's deploy overwrites another's state, orphaning a pod that
-  keeps billing with nothing tracking it.
-- **Killed pods** — a teardown with no owner check tears down a pod another worker is
-  still using.
-- **Idle burn** — a pod finishes its work (or never really started) and sits at 0% GPU
-  for hours because nothing is watching.
-
-podtrack replaces that file with a concurrency-safe **SQLite registry** (WAL mode) plus
-a reaper that runs on a timer and cleans up on its own.
-
 ## Install
 
 ```bash
@@ -247,6 +232,15 @@ and label continuity, `claim`, and schema migration are covered by tests. The de
 `arm`/supervisor/`pet`/`sync` path and the ephemeral-volume deploy path have been
 exercised individually; a full unattended dead-man fire-to-confirmation is still on the
 list. The grace + strikes safety net protects active pods regardless.
+
+## Disclaimer
+
+podtrack terminates paid cloud resources automatically. It is provided **as is, with no
+warranty of any kind**. You are responsible for how you configure and run it, and for any
+cost, data loss, or terminated pod that results from using it — including bugs, missed
+reaps, or an unintended teardown. Test it against throwaway pods before trusting it with
+anything expensive. This is the plain-language version of the warranty and liability
+terms in the [LICENSE](LICENSE), which govern.
 
 ## License
 
