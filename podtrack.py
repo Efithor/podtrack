@@ -533,9 +533,22 @@ class Registry:
         return rc == 0 and "ALIVE" in out
 
     def _launch_deadman(self, pod):
+        """Launch the supervisor detached. Idempotent (skips if one already runs),
+        so a retry after an ambiguous first attempt cannot stack duplicates.
+        ⚠ On some pods (observed: A100 secure cloud) the SSH channel fails to
+        close after a successful detached launch, so rc=255 here means UNKNOWN,
+        not failed — _deadman_alive() is the only authoritative signal. The
+        trailing `exec 1>&- 2>&-` releases the session's pipes so sshd can
+        close the channel even if a descendant is holding it open.
+        ⚠ The launch path is spelled `.s\\h` because the guard's pgrep and the
+        plain path share ONE remote cmdline: an unbroken path makes the guard
+        self-match and skip the launch unconditionally. bash strips the
+        backslash, so the supervisor's own cmdline stays clean for pgrep."""
         return ssh_run(
-            pod, f"setsid nohup bash {self.DEADMAN_PROC} "
-                 f"</dev/null >{self.DEADMAN_DIR}/supervisor.log 2>&1 &", timeout=20)
+            pod, f"if ! pgrep -f '[d]eadman_supervisor[.]sh' >/dev/null; then "
+                 f"setsid nohup bash {self.DEADMAN_PROC[:-2]}s\\h "   # bash: /dev/shm is noexec on RunPod images
+                 f"</dev/null >{self.DEADMAN_DIR}/supervisor.log 2>&1 & "
+                 f"fi; exec 1>&- 2>&-", timeout=20, warn=False)
 
     def arm(self, pod_id, kill_in_min, token_file=None, kill_absolute_min=None):
         """Plant an on-pod self-destruct that fires at now+kill_in_min unless petted,
@@ -559,8 +572,10 @@ class Registry:
             print(f"# arm: dead-man credential = {key_src}", file=sys.stderr)
         script = DEADMAN_SH.read_text()
         supervisor = DEADMAN_SUP.read_text()
-        # install: drop key to tmpfs, write deadline + both scripts, launch the
-        # SUPERVISOR detached (it keeps deadman.sh respawned — #3).
+        # INSTALL only — drop key to tmpfs, write deadline + both scripts. The
+        # detached launch is deliberately NOT in this payload: with nothing
+        # backgrounded the channel closes promptly and this rc is trustworthy,
+        # so a nonzero rc here is a genuine install failure.
         rc, out, err = ssh_run(pod, (
             f"mkdir -p /dev/shm/podtrack && umask 077 && "
             f"printf '%s' '{key}' > /dev/shm/podtrack/rpk && "
@@ -568,12 +583,16 @@ class Registry:
             f"printf '%s' '{_ts(deadline)}' > /dev/shm/podtrack/deadline && "
             f"cat > /dev/shm/podtrack/deadman.sh <<'PTEOF'\n{script}\nPTEOF\n"
             f"cat > /dev/shm/podtrack/deadman_supervisor.sh <<'PTSUP'\n{supervisor}\nPTSUP\n"
-            f"chmod +x /dev/shm/podtrack/deadman.sh /dev/shm/podtrack/deadman_supervisor.sh && "
-            f"setsid nohup bash /dev/shm/podtrack/deadman_supervisor.sh "   # bash: /dev/shm is noexec on RunPod images
-            f"</dev/null >/dev/shm/podtrack/supervisor.log 2>&1 &"
+            f"chmod +x /dev/shm/podtrack/deadman.sh /dev/shm/podtrack/deadman_supervisor.sh"
         ), timeout=40)
         if rc != 0:
             raise SystemExit(f"arm failed (rc={rc}): {err or out}")
+        # LAUNCH, transport-tolerant: on some pods the channel hangs open after
+        # a successful detached launch (rc=255 "ssh timeout" while the
+        # supervisor runs fine), so the launch rc is ignored — a transport
+        # failure means UNKNOWN, and the fresh-session VERIFY below is the
+        # authoritative signal in both directions.
+        self._launch_deadman(pod)
         # VERIFY (#1): the watchdog must actually be running, else this pod is
         # unprotected despite deadman=1. One relaunch attempt, then hard-fail.
         alive = self._deadman_alive(pod)
