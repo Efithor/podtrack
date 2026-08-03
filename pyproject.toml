@@ -1,12 +1,13 @@
 [project]
 name = "podtrack"
-version = "0.4.0"
+version = "0.4.1"
 description = "Ownership-aware RunPod pod registry and autonomous reaper for shared accounts"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 authors = [{ name = "Efithor", email = "efithor@gmail.com" }]
-keywords = ["runpod", "gpu", "cost-control", "infrastructure", "reaper"]
+keywords = ["runpod", "gpu", "gpu-cloud", "cloud-gpu", "cost-control", "cost-optimization",
+            "infrastructure", "reaper", "idle-detection", "dead-man-switch", "mlops"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -21,6 +22,7 @@ classifiers = [
 Homepage = "https://github.com/Efithor/podtrack"
 Repository = "https://github.com/Efithor/podtrack"
 Issues = "https://github.com/Efithor/podtrack/issues"
+"Author's Site" = "https://www.nodeorange.com/"
 
 [project.scripts]
 podtrack = "podtrack:main"

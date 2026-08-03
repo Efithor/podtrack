@@ -1,5 +1,9 @@
 # podtrack
 
+[![PyPI](https://img.shields.io/pypi/v/podtrack)](https://pypi.org/project/podtrack/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://pypi.org/project/podtrack/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An ownership-aware registry **and autonomous reaper** for [RunPod](https://runpod.io)
 pods. It lets several independent workers share one RunPod account without losing,
 orphaning, or killing each other's pods — and it terminates idle or expired GPUs on
