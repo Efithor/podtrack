@@ -27,14 +27,19 @@ Capabilities
                      pod self-terminates at its deadline even if the host machine
                      is asleep. The reaper "pets" it (slides the deadline) while a
                      job is healthy.
+7. Multi-account   — every pod row carries the RunPod ACCOUNT it lives on; keys
+                     are held per account and reconcile/reap sweep all configured
+                     accounts, so pods on a second account are never invisible.
 
-Credential mandate: podtrack is custodian of the RunPod key (`adopt-key`).
+Credential mandate: podtrack is custodian of every RunPod key
+(`adopt-key [--account NAME --from PATH]`).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -119,47 +124,86 @@ def whoami(uuid: str | None = None, label: str | None = None) -> tuple[str, str]
 
 
 # --------------------------------------------------------------- key custodian
-def adopt_key() -> str:
+# Accounts are named credential slots. "main" is the original single account
+# (custody file `runpod.key`); any other account NAME keeps its key at
+# `runpod.<NAME>.key`. A pod row records which account it lives on, so every
+# API call about that pod authenticates against the right key.
+ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _cred_path(account: str = "main") -> Path:
+    if not ACCOUNT_RE.match(account):
+        raise SystemExit(f"bad account name '{account}' (want lowercase [a-z0-9_-])")
+    return CRED_PATH if account == "main" else CRED_DIR / f"runpod.{account}.key"
+
+
+def configured_accounts() -> list[str]:
+    """Accounts with a key in custody, 'main' first. This is what reconcile/reap
+    sweep — a pod on an account without a key here is INVISIBLE to podtrack."""
+    accts = ["main"] if CRED_PATH.exists() else []
+    for p in sorted(CRED_DIR.glob("runpod.*.key")):
+        name = p.name[len("runpod."):-len(".key")]
+        if name and ACCOUNT_RE.match(name):
+            accts.append(name)
+    return accts
+
+
+def adopt_key(account: str = "main", source: str | None = None) -> str:
+    cred = _cred_path(account)
     CRED_DIR.mkdir(parents=True, exist_ok=True)
-    if CRED_PATH.exists():
-        return f"already adopted: {CRED_PATH}"
-    if not LEGACY_KEY.exists():
-        raise SystemExit(f"no key at {LEGACY_KEY} to adopt (and none at {CRED_PATH})")
-    CRED_PATH.write_text(LEGACY_KEY.read_text())
-    CRED_PATH.chmod(0o600)
-    LEGACY_KEY.write_text(
-        "# MOVED. The RunPod API key is now managed by podtrack.\n"
+    if cred.exists():
+        return f"already adopted: {cred}"
+    src = (Path(source).expanduser() if source
+           else LEGACY_KEY if account == "main"
+           else Path.home() / f".keys/runpod-{account}")
+    if not src.exists():
+        raise SystemExit(f"no key at {src} to adopt (and none at {cred})")
+    text = src.read_text()
+    if "MOVED" in text:
+        raise SystemExit(f"{src} is already a moved-notice stub; nothing to adopt")
+    cred.write_text(text)
+    cred.chmod(0o600)
+    src.write_text(
+        f"# MOVED. The RunPod API key (account '{account}') is now managed by podtrack.\n"
         "# Do NOT read this file or call the RunPod API directly.\n"
-        f"# Use: podtrack <cmd>.  Key custodian: {CRED_PATH}\n")
-    LEGACY_KEY.chmod(0o600)
-    return f"adopted: {LEGACY_KEY} -> {CRED_PATH} (legacy path now a notice)"
+        f"# Use: podtrack <cmd>.  Key custodian: {cred}\n")
+    src.chmod(0o600)
+    return f"adopted [{account}]: {src} -> {cred} (source path now a notice)"
 
 
-def runpod_key() -> str:
-    if CRED_PATH.exists():
-        return CRED_PATH.read_text().strip()
-    if LEGACY_KEY.exists() and "MOVED" not in LEGACY_KEY.read_text(errors="replace"):
+def runpod_key(account: str = "main") -> str:
+    cred = _cred_path(account)
+    if cred.exists():
+        return cred.read_text().strip()
+    if (account == "main" and LEGACY_KEY.exists()
+            and "MOVED" not in LEGACY_KEY.read_text(errors="replace")):
         raise SystemExit(f"RunPod key still at {LEGACY_KEY}; run `podtrack adopt-key`.")
-    raise SystemExit(f"no RunPod key at {CRED_PATH}; run `podtrack adopt-key`.")
+    raise SystemExit(f"no RunPod key for account '{account}' at {cred}; "
+                     f"run `podtrack adopt-key --account {account} [--from PATH]`.")
 
 
-def deadman_token(token_file: str | None = None) -> tuple[str, str]:
+def deadman_token(token_file: str | None = None, account: str = "main") -> tuple[str, str]:
     """Resolve the credential to plant in the on-pod dead-man switch (failure mode #4).
 
-    Order: explicit --token-file  >  restricted token at DEADMAN_TOKEN_PATH  >
-    (loud fallback) the full account key. The full key sitting plaintext in a
+    Order: explicit --token-file  >  restricted token for the pod's ACCOUNT
+    (`deadman.token` for main, `deadman.<account>.token` otherwise)  >  (loud
+    fallback) that account's full key. The full key sitting plaintext in a
     pod's /dev/shm is the failure we're closing: a restricted token means a
-    leaked pod can only terminate ITSELF, not the whole account. Returns
+    leaked pod can only terminate ITSELF, not the whole account. The credential
+    MUST belong to the pod's own account — a cross-account podTerminate is
+    silently unauthorized and the switch would never confirm the kill. Returns
     (secret, human-readable-source); callers WARN when the source is the full key."""
     if token_file:
         return Path(token_file).read_text().strip(), f"token-file {token_file}"
-    if DEADMAN_TOKEN_PATH.exists():
-        return DEADMAN_TOKEN_PATH.read_text().strip(), f"restricted token {DEADMAN_TOKEN_PATH}"
-    return runpod_key(), "FULL ACCOUNT KEY (no restricted token configured)"
+    tok = (DEADMAN_TOKEN_PATH if account == "main"
+           else CRED_DIR / f"deadman.{account}.token")
+    if tok.exists():
+        return tok.read_text().strip(), f"restricted token {tok}"
+    return runpod_key(account), f"FULL ACCOUNT KEY '{account}' (no restricted token configured)"
 
 
 # ------------------------------------------------------------------ RunPod API
-def gql(query: str, variables: dict | None = None) -> dict:
+def gql(query: str, variables: dict | None = None, account: str = "main") -> dict:
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
     # #15: send the key in an Authorization header, NOT the URL query string, so it
     # can't leak into access logs / proxies / crash traces. RunPod accepts
@@ -167,7 +211,7 @@ def gql(query: str, variables: dict | None = None) -> dict:
     req = urllib.request.Request(
         RUNPOD_API, data=body,
         headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (podtrack)",
-                 "Authorization": f"Bearer {runpod_key()}"})
+                 "Authorization": f"Bearer {runpod_key(account)}"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             out = json.loads(r.read().decode())
@@ -178,13 +222,13 @@ def gql(query: str, variables: dict | None = None) -> dict:
     return out.get("data", {})
 
 
-def fetch_remote_pods() -> list[dict]:
+def fetch_remote_pods(account: str = "main") -> list[dict]:
     q = """query { myself { pods {
         id name desiredStatus costPerHr
         machine { gpuDisplayName }
         runtime { uptimeInSeconds gpus { id gpuUtilPercent }
                   ports { ip publicPort privatePort type } } } } }"""
-    pods = (gql(q).get("myself") or {}).get("pods") or []
+    pods = (gql(q, account=account).get("myself") or {}).get("pods") or []
     norm = []
     for p in pods:
         rt = p.get("runtime") or {}
@@ -199,12 +243,13 @@ def fetch_remote_pods() -> list[dict]:
             "gpu_type": (p.get("machine") or {}).get("gpuDisplayName"),
             "n_gpus": len(gpus), "uptime_s": rt.get("uptimeInSeconds"),
             "gpu_util": max((g.get("gpuUtilPercent") or 0) for g in gpus) if gpus else None,
-            "ssh_ip": ssh_ip, "ssh_port": ssh_port})
+            "ssh_ip": ssh_ip, "ssh_port": ssh_port, "account": account})
     return norm
 
 
-def terminate_remote(pod_id: str):
-    gql("mutation($i:PodTerminateInput!){podTerminate(input:$i)}", {"i": {"podId": pod_id}})
+def terminate_remote(pod_id: str, account: str = "main"):
+    gql("mutation($i:PodTerminateInput!){podTerminate(input:$i)}", {"i": {"podId": pod_id}},
+        account=account)
 
 
 # ---- ephemeral network-volume lifecycle (failure mode #10 / policy P-2) ----
@@ -218,23 +263,26 @@ EPH_VOLUME_PREFIX = "pt-eph-"      # names ephemeral, sweepable volumes (P-1 lea
 _STOCK_RANK = {"High": 3, "Medium": 2, "Low": 1, None: 0}
 
 
-def create_network_volume(name: str, size_gb: int, datacenter_id: str) -> dict:
+def create_network_volume(name: str, size_gb: int, datacenter_id: str,
+                          account: str = "main") -> dict:
     q = ("mutation($i:CreateNetworkVolumeInput!){createNetworkVolume(input:$i)"
          "{id name size dataCenterId}}")
-    return gql(q, {"i": {"name": name, "size": size_gb, "dataCenterId": datacenter_id}})["createNetworkVolume"]
+    return gql(q, {"i": {"name": name, "size": size_gb, "dataCenterId": datacenter_id}},
+               account=account)["createNetworkVolume"]
 
 
-def delete_network_volume(volume_id: str) -> None:
+def delete_network_volume(volume_id: str, account: str = "main") -> None:
     gql("mutation($i:DeleteNetworkVolumeInput!){deleteNetworkVolume(input:$i)}",
-        {"i": {"id": volume_id}})
+        {"i": {"id": volume_id}}, account=account)
 
 
-def list_network_volumes() -> list[dict]:
-    return ((gql("query{myself{networkVolumes{id name size dataCenterId}}}").get("myself") or {})
+def list_network_volumes(account: str = "main") -> list[dict]:
+    return ((gql("query{myself{networkVolumes{id name size dataCenterId}}}",
+                 account=account).get("myself") or {})
             .get("networkVolumes") or [])
 
 
-def datacenters_for_gpu(gpu_type_id: str) -> list[dict]:
+def datacenters_for_gpu(gpu_type_id: str, account: str = "main") -> list[dict]:
     """DCs that BOTH support network volumes AND currently have `gpu_type_id`
     available, best-stock first. Resolves the datacenter oddity: the ephemeral
     volume is created in a DC we then pin the pod to, so it can never silently
@@ -242,7 +290,7 @@ def datacenters_for_gpu(gpu_type_id: str) -> list[dict]:
     q = ("query{dataCenters{id storageSupport "
          "gpuAvailability{gpuTypeId available stockStatus}}}")
     out = []
-    for dc in (gql(q).get("dataCenters") or []):
+    for dc in (gql(q, account=account).get("dataCenters") or []):
         if not dc.get("storageSupport"):
             continue
         for ga in (dc.get("gpuAvailability") or []):
@@ -254,10 +302,10 @@ def datacenters_for_gpu(gpu_type_id: str) -> list[dict]:
     return out
 
 
-def pod_desired_status(pod_id: str) -> str | None:
+def pod_desired_status(pod_id: str, account: str = "main") -> str | None:
     """Live desiredStatus for a pod, or None if it's gone (confirmation signal)."""
     q = "query($id:String!){pod(input:{podId:$id}){desiredStatus}}"
-    pod = gql(q, {"id": pod_id}).get("pod")
+    pod = gql(q, {"id": pod_id}, account=account).get("pod")
     return (pod or {}).get("desiredStatus") if pod else None
 
 
@@ -329,6 +377,7 @@ NEW_COLS = {
     "vanish_strikes": "INTEGER DEFAULT 0",   # consecutive fetches a live pod was absent (#11 guard)
     "kill_after_absolute": "TEXT",         # hard TTL cap that ignores heartbeats (#6)
     "no_artifacts": "INTEGER DEFAULT 0",   # opt-out: short job with intentionally no artifacts (#9)
+    "account": "TEXT DEFAULT 'main'",      # which RunPod account the pod lives on (v0.4)
 }
 
 
@@ -356,6 +405,11 @@ class Registry:
                         (_ts(), pod_id, self.uuid, self.label, action, detail))
         self.db.commit()
 
+    @staticmethod
+    def _acct(pod) -> str:
+        """Account a pod row lives on ('main' for pre-v0.4 rows)."""
+        return pod.get("account") or "main"
+
     # ---- ownership (continuity follows LABEL; UUID is forensic) ----
     def _owns(self, pod) -> str | bool:
         if pod["owner_uuid"] == self.uuid:
@@ -376,12 +430,20 @@ class Registry:
     # ---- CRUD ----
     def register(self, pod_id, gpu_type=None, ssh_ip=None, ssh_port=None, cost_per_hr=None,
                  status="running", remote_path=None, local_path=None, ssh_key=None,
-                 volume_id=None, no_artifacts=False, notes=None):
+                 volume_id=None, no_artifacts=False, notes=None, account=None):
+        account = account or os.environ.get("PODTRACK_ACCOUNT") or "main"
+        # A pod filed under an account with no key in custody would be invisible
+        # to reconcile/reap forever — the exact leak podtrack exists to prevent.
+        if account not in configured_accounts():
+            raise SystemExit(
+                f"account '{account}' has no key in custody (configured: "
+                f"{configured_accounts() or 'NONE'}). Run `podtrack adopt-key "
+                f"--account {account} --from PATH` first.")
         self.db.execute(
             "INSERT INTO pods(pod_id,owner_uuid,owner_label,gpu_type,ssh_ip,ssh_port,status,"
             "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,ssh_key,volume_id,"
-            "no_artifacts,notes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "no_artifacts,notes,account) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(pod_id) DO UPDATE SET owner_uuid=excluded.owner_uuid,"
             "owner_label=excluded.owner_label,gpu_type=COALESCE(excluded.gpu_type,gpu_type),"
             "ssh_ip=COALESCE(excluded.ssh_ip,ssh_ip),ssh_port=COALESCE(excluded.ssh_port,ssh_port),"
@@ -389,12 +451,12 @@ class Registry:
             "local_path=COALESCE(excluded.local_path,local_path),"
             "ssh_key=COALESCE(excluded.ssh_key,ssh_key),"
             "volume_id=COALESCE(excluded.volume_id,volume_id),"
-            "no_artifacts=excluded.no_artifacts",
+            "no_artifacts=excluded.no_artifacts,account=excluded.account",
             (pod_id, self.uuid, self.label, gpu_type, ssh_ip, ssh_port, status, cost_per_hr,
              _ts(), _ts(), remote_path, local_path, ssh_key, volume_id,
-             1 if no_artifacts else 0, notes))
+             1 if no_artifacts else 0, notes, account))
         self.db.commit()
-        self._log(pod_id, "register", f"{self.label} gpu={gpu_type}"
+        self._log(pod_id, "register", f"{self.label} gpu={gpu_type} acct={account}"
                   + (f" vol={volume_id}" if volume_id else ""))
         return self.get(pod_id)
 
@@ -488,7 +550,7 @@ class Registry:
         deadline = _now() + timedelta(minutes=kill_in_min)
         abs_deadline = (_now() + timedelta(minutes=kill_absolute_min)
                         if kill_absolute_min else None)
-        key, key_src = deadman_token(token_file)
+        key, key_src = deadman_token(token_file, account=self._acct(pod))
         if "FULL ACCOUNT KEY" in key_src:
             print(f"# WARNING: arming {pod_id} with the FULL RunPod account key in the pod's "
                   f"/dev/shm. Prefer a restricted token — drop one at {DEADMAN_TOKEN_PATH} "
@@ -589,7 +651,7 @@ class Registry:
                     f"(rsync_ok={ok}, local_nonempty={nonempty}). Pod left UP. "
                     f"Fix sync or use --force. ({err.strip()[:120]})")
             pull_verified = True
-        terminate_remote(pod_id)
+        terminate_remote(pod_id, account=self._acct(pod))
         self.db.execute("UPDATE pods SET status='terminated', terminated_at=? WHERE pod_id=?",
                         (_ts(), pod_id))
         self.db.commit()
@@ -615,7 +677,7 @@ class Registry:
             self._log(pod["pod_id"], "volume-kept-unpulled", vid)
             return
         try:
-            delete_network_volume(vid)
+            delete_network_volume(vid, account=self._acct(pod))
             self.db.execute("UPDATE pods SET volume_deleted_at=? WHERE pod_id=?",
                             (_ts(), pod["pod_id"]))
             self.db.commit()
@@ -628,70 +690,107 @@ class Registry:
 
     def sweep_volumes(self, force=False):
         """Leak sweep (P-1 enforcement): delete ephemeral `pt-eph-*` volumes not
-        referenced by any live pod in the registry. Volumes unknown to the
-        registry are only deleted with force=True (a fresh volume mid-deploy is
-        briefly unknown — avoid racing it). Returns (deleted, skipped)."""
+        referenced by any live pod in the registry, across ALL configured
+        accounts. Volumes unknown to the registry are only deleted with
+        force=True (a fresh volume mid-deploy is briefly unknown — avoid racing
+        it). Returns (deleted, skipped)."""
         live_vids = {p["volume_id"] for p in self.list_pods("all")
                      if p.get("volume_id") and p["status"] in LIVE_STATUSES}
         known_vids = {p["volume_id"] for p in self.list_pods("all") if p.get("volume_id")}
         deleted, skipped = [], []
-        for v in list_network_volumes():
-            if not (v.get("name") or "").startswith(EPH_VOLUME_PREFIX):
-                continue
-            vid = v["id"]
-            if vid in live_vids:
-                skipped.append((vid, "attached to live pod"))
-                continue
-            if vid not in known_vids and not force:
-                skipped.append((vid, "unknown to registry (use --force)"))
-                continue
+        for acct in configured_accounts():
             try:
-                delete_network_volume(vid)
-                deleted.append(vid)
-                self._log(vid, "volume-sweep", v.get("name", ""))
+                vols = list_network_volumes(acct)
             except SystemExit as e:
-                skipped.append((vid, f"delete failed: {str(e)[:80]}"))
+                skipped.append((f"[{acct}]", f"volume list failed: {str(e)[:80]}"))
+                continue
+            for v in vols:
+                if not (v.get("name") or "").startswith(EPH_VOLUME_PREFIX):
+                    continue
+                vid = v["id"]
+                if vid in live_vids:
+                    skipped.append((vid, "attached to live pod"))
+                    continue
+                if vid not in known_vids and not force:
+                    skipped.append((vid, "unknown to registry (use --force)"))
+                    continue
+                try:
+                    delete_network_volume(vid, account=acct)
+                    deleted.append(vid)
+                    self._log(vid, "volume-sweep", f"[{acct}] {v.get('name', '')}")
+                except SystemExit as e:
+                    skipped.append((vid, f"delete failed: {str(e)[:80]}"))
         return deleted, skipped
 
     # ---- reconcile ----
     def reconcile(self, terminate_untracked=False):
-        remote = {p["pod_id"]: p for p in fetch_remote_pods()}
+        """Diff registry vs live RunPod across ALL configured accounts. Each
+        account is fetched with its own key; a failed fetch skips that account's
+        vanish sweep entirely (an auth/network blip must not mark its pods
+        terminated). Pods on an account with no key in custody are warned about
+        — podtrack cannot see or reap them."""
+        accounts = configured_accounts()
         known = {p["pod_id"]: p for p in self.list_pods("all")}
+        keyless = sorted({self._acct(p) for p in known.values()
+                          if p["status"] in LIVE_STATUSES and self._acct(p) not in accounts})
+        if keyless:
+            print(f"# WARN: registry has live pods on account(s) {keyless} with no key in "
+                  f"custody — they CANNOT be reconciled or reaped. `podtrack adopt-key "
+                  f"--account <name>` to restore visibility.", file=sys.stderr)
+        remote_by_acct: dict = {}                # acct -> {pod_id: pod} | None (fetch failed)
+        for acct in accounts:
+            try:
+                remote_by_acct[acct] = {p["pod_id"]: p for p in fetch_remote_pods(acct)}
+            except SystemExit as e:
+                print(f"# WARN: pod fetch failed for account '{acct}': {str(e)[:140]} — "
+                      f"skipping its vanish sweep this cycle.", file=sys.stderr)
+                remote_by_acct[acct] = None
+        seen_live = {pid for r in remote_by_acct.values() if r for pid in r}
         s = {"live": [], "untracked": [], "vanished": [], "idle_or_cpu": []}
-        for pid, rp in remote.items():
-            running = rp["desired"] == "RUNNING"
-            if running and (not rp["n_gpus"] or
-                            (rp["gpu_util"] == 0 and (rp["uptime_s"] or 0) > 600)):
-                s["idle_or_cpu"].append(pid)
-            if pid in known:
-                self.db.execute(
-                    "UPDATE pods SET status=?,gpu_type=COALESCE(?,gpu_type),cost_per_hr=?,"
-                    "ssh_ip=COALESCE(?,ssh_ip),ssh_port=COALESCE(?,ssh_port),"
-                    "last_gpu_util=?,gpu_verified_at=?,vanish_strikes=0 WHERE pod_id=?",
-                    ("running" if running else "exited", rp["gpu_type"], rp["cost_per_hr"],
-                     rp["ssh_ip"], rp["ssh_port"], rp["gpu_util"],
-                     _ts() if rp["n_gpus"] else None, pid))
-                s["live"].append(pid)
-            else:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO pods(pod_id,owner_uuid,owner_label,gpu_type,ssh_ip,"
-                    "ssh_port,status,cost_per_hr,deployed_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (pid, "UNKNOWN", "UNTRACKED", rp["gpu_type"], rp["ssh_ip"], rp["ssh_port"],
-                     "untracked", rp["cost_per_hr"], _ts(), "discovered by reconcile"))
-                s["untracked"].append(pid)
-                self._log(pid, "reconcile", "found untracked/leaked pod")
-        # #11 vanished-guard: a truncated/partial fetch must not mark live pods gone
-        # (that hides a still-billing pod as an un-reapable "terminated" leak).
-        known_live = [k for k in known.values() if k["status"] in LIVE_STATUSES]
-        if not remote and known_live:
-            # 0 pods returned while we believe some are live -> almost certainly a
-            # failed/truncated fetch, not a mass termination. Skip the sweep entirely.
-            print(f"# WARN: RunPod returned 0 pods but registry has {len(known_live)} live; "
-                  f"skipping vanish sweep this cycle (likely a partial/failed fetch).",
-                  file=sys.stderr)
-        else:
-            for pid, kp in known.items():
-                if pid in remote or kp["status"] not in LIVE_STATUSES:
+        for acct, remote in remote_by_acct.items():
+            if remote is None:
+                continue
+            for pid, rp in remote.items():
+                running = rp["desired"] == "RUNNING"
+                if running and (not rp["n_gpus"] or
+                                (rp["gpu_util"] == 0 and (rp["uptime_s"] or 0) > 600)):
+                    s["idle_or_cpu"].append(pid)
+                if pid in known:
+                    # account=? self-heals a row filed under the wrong account —
+                    # the fetch that actually returned the pod is the truth.
+                    self.db.execute(
+                        "UPDATE pods SET status=?,gpu_type=COALESCE(?,gpu_type),cost_per_hr=?,"
+                        "ssh_ip=COALESCE(?,ssh_ip),ssh_port=COALESCE(?,ssh_port),"
+                        "last_gpu_util=?,gpu_verified_at=?,vanish_strikes=0,account=? "
+                        "WHERE pod_id=?",
+                        ("running" if running else "exited", rp["gpu_type"], rp["cost_per_hr"],
+                         rp["ssh_ip"], rp["ssh_port"], rp["gpu_util"],
+                         _ts() if rp["n_gpus"] else None, acct, pid))
+                    s["live"].append(pid)
+                else:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO pods(pod_id,owner_uuid,owner_label,gpu_type,"
+                        "ssh_ip,ssh_port,status,cost_per_hr,deployed_at,notes,account) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (pid, "UNKNOWN", "UNTRACKED", rp["gpu_type"], rp["ssh_ip"],
+                         rp["ssh_port"], "untracked", rp["cost_per_hr"], _ts(),
+                         "discovered by reconcile", acct))
+                    s["untracked"].append(pid)
+                    self._log(pid, "reconcile", f"found untracked/leaked pod [{acct}]")
+            # #11 vanished-guard, PER ACCOUNT: a truncated/partial fetch must not mark
+            # live pods gone (that hides a still-billing pod as an un-reapable
+            # "terminated" leak). 0 pods returned while the registry believes this
+            # account has live ones -> almost certainly a failed/truncated fetch.
+            acct_known = {pid: kp for pid, kp in known.items() if self._acct(kp) == acct}
+            acct_live = [k for k in acct_known.values() if k["status"] in LIVE_STATUSES]
+            if not remote and acct_live:
+                print(f"# WARN: account '{acct}' returned 0 pods but registry has "
+                      f"{len(acct_live)} live there; skipping its vanish sweep this cycle "
+                      f"(likely a partial/failed fetch).", file=sys.stderr)
+                continue
+            for pid, kp in acct_known.items():
+                # seen_live (any account) covers rows whose account column was stale.
+                if pid in seen_live or kp["status"] not in LIVE_STATUSES:
                     continue
                 vs = (kp["vanish_strikes"] or 0) + 1
                 if vs >= 2:                     # confirmed absent across 2 consecutive fetches
@@ -867,10 +966,12 @@ class Registry:
 def _print_pods(pods):
     if not pods:
         print("  (none)"); return
-    print(f"  {'pod_id':<16}{'status':<12}{'gpu':<20}{'owner':<16}{'util':<6}{'kill_after':<22}ssh")
+    print(f"  {'pod_id':<16}{'acct':<8}{'status':<12}{'gpu':<20}{'owner':<16}{'util':<6}"
+          f"{'kill_after':<22}ssh")
     for p in pods:
         ssh = f"{p['ssh_ip']}:{p['ssh_port']}" if p["ssh_ip"] else "-"
-        print(f"  {p['pod_id']:<16}{(p['status'] or '?'):<12}{(p['gpu_type'] or '?'):<20}"
+        print(f"  {p['pod_id']:<16}{(p.get('account') or 'main'):<8}"
+              f"{(p['status'] or '?'):<12}{(p['gpu_type'] or '?'):<20}"
               f"{(p['owner_label'] or '?'):<16}{str(p['last_gpu_util'] if p['last_gpu_util'] is not None else '-'):<6}"
               f"{(p['kill_after'] or '-'):<22}{ssh}")
 
@@ -879,10 +980,17 @@ def main():
     ap = argparse.ArgumentParser(prog="podtrack", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("whoami"); sub.add_parser("adopt-key")
+    sub.add_parser("whoami"); sub.add_parser("accounts")
+    ak = sub.add_parser("adopt-key")
+    ak.add_argument("--account", default="main", help="credential slot name (default: main)")
+    ak.add_argument("--from", dest="source",
+                    help="key file to adopt (defaults: ~/.keys/runpod for main, "
+                         "~/.keys/runpod-<account> otherwise)")
     r = sub.add_parser("register"); r.add_argument("pod_id")
     for f in ("--label", "--gpu", "--ssh-ip", "--remote-path", "--local-path", "--ssh-key"):
         r.add_argument(f)
+    r.add_argument("--account", help="RunPod account the pod lives on "
+                                     "(env PODTRACK_ACCOUNT; default: main)")
     r.add_argument("--ssh-port", type=int); r.add_argument("--cost", type=float)
     r.add_argument("--volume-id", help="ephemeral network volume attached to this pod (P-2)")
     r.add_argument("--no-artifacts", action="store_true",
@@ -919,15 +1027,23 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == "adopt-key":
-        print(adopt_key()); return
+        print(adopt_key(a.account, a.source)); return
+    if a.cmd == "accounts":
+        accts = configured_accounts()
+        if not accts:
+            print("(no accounts configured; run `podtrack adopt-key`)")
+        for acct in accts:
+            print(f"{acct:<10} {_cred_path(acct)}")
+        return
     if a.cmd == "whoami":
         u, l = whoami(); print(f"owner_uuid: {u}\nowner_label: {l}"); return
     reg = Registry(owner_label=getattr(a, "label", None))
     if a.cmd == "register":
         p = reg.register(a.pod_id, gpu_type=a.gpu, ssh_ip=a.ssh_ip, ssh_port=a.ssh_port,
                          cost_per_hr=a.cost, remote_path=a.remote_path, local_path=a.local_path,
-                         ssh_key=a.ssh_key, volume_id=a.volume_id, no_artifacts=a.no_artifacts)
-        print(f"registered {p['pod_id']} -> '{p['owner_label']}'")
+                         ssh_key=a.ssh_key, volume_id=a.volume_id, no_artifacts=a.no_artifacts,
+                         account=a.account)
+        print(f"registered {p['pod_id']} -> '{p['owner_label']}' [{p['account'] or 'main'}]")
     elif a.cmd == "job-heartbeat":
         reg.job_heartbeat(a.pod_id); print(f"job-heartbeat {a.pod_id}")
     elif a.cmd == "list":

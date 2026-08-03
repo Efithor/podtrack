@@ -1,6 +1,6 @@
 [project]
 name = "podtrack"
-version = "0.3.0"
+version = "0.4.0"
 description = "Ownership-aware RunPod pod registry and autonomous reaper for shared accounts"
 readme = "README.md"
 license = { text = "MIT" }

@@ -58,9 +58,12 @@ export PODTRACK_OWNER_UUID=$(uuidgen)   # optional; a stable value is persisted 
 
 ```bash
 podtrack adopt-key                          # one-time: take custody of the RunPod key
+podtrack adopt-key --account pro --from ~/.keys/runpod-pro   # additional accounts
+podtrack accounts                           # list configured accounts + custody paths
 podtrack whoami
 podtrack register <id> --gpu H100 --ssh-ip .. --ssh-port .. \
-                       --remote-path /root/run/results --local-path ~/data/run
+                       --remote-path /root/run/results --local-path ~/data/run \
+                       [--account pro]      # default: $PODTRACK_ACCOUNT or main
 podtrack list [--all|--mine|--others]
 podtrack claim <id>                         # explicit ownership handoff / adopt orphan
 podtrack probe <id>                         # SSH nvidia-smi GPU-util check
@@ -69,7 +72,7 @@ podtrack arm <id> --kill-in 120 [--token-file RESTRICTED]   # plant + verify dea
 podtrack pet <id> --min 30                  # slide the dead-man deadline forward
 podtrack sync <id>                          # rsync artifacts remote -> local
 podtrack teardown <id> [--force] [--skip-pull]   # owner-guarded pull-verify-kill
-podtrack reconcile [--terminate-untracked]  # diff vs the live account; flag leaks/idle
+podtrack reconcile [--terminate-untracked]  # diff vs ALL live accounts; flag leaks/idle
 podtrack sweep-volumes [--force]            # delete leaked ephemeral network volumes
 podtrack reap [--no-mirror]                 # autonomous: reconcile+mirror+pet+re-arm+teardown
 ```
@@ -153,19 +156,30 @@ alive, and the network volume keeps the data.
 
 ## Credential handling
 
-podtrack is the custodian of the RunPod API key. `adopt-key` moves the key into
+podtrack is the custodian of every RunPod API key. `adopt-key` moves a key into
 `~/.config/podtrack/` so the only sanctioned path to RunPod is through podtrack. The key
 is sent in an `Authorization: Bearer` header, never in a URL query string, so it can't
 leak into request logs or proxies.
 
-The on-pod dead-man switch needs a credential to terminate its own pod. To avoid putting
-the full account key on rented hardware, `arm` resolves the on-pod credential in this
-order:
+### Multiple accounts
+
+Accounts are named credential slots: the original account is `main`
+(`runpod.key`); any other account `NAME` keeps its key at `runpod.NAME.key` after
+`adopt-key --account NAME [--from PATH]`. Every pod row records its account, all
+API calls about a pod authenticate with that account's key, and `reconcile` /
+`reap` / `sweep-volumes` sweep **all** configured accounts each cycle — a pod on
+a second account is never invisible to leak detection. `register` refuses an
+account with no key in custody (such a pod could never be reconciled or reaped).
+
+The on-pod dead-man switch needs a credential to terminate its own pod — one
+belonging to the pod's *own account*. To avoid putting a full account key on
+rented hardware, `arm` resolves the on-pod credential in this order:
 
 1. `arm --token-file <path>`
-2. `~/.config/podtrack/deadman.token` — a **restricted RunPod token**, ideally scoped to
-   `podTerminate` only
-3. the full account key, **with a loud warning**
+2. `~/.config/podtrack/deadman.token` (account `main`) or
+   `~/.config/podtrack/deadman.<account>.token` — a **restricted RunPod token**,
+   ideally scoped to `podTerminate` only
+3. that account's full key, **with a loud warning**
 
 Drop a restricted token at that path so a leaked pod can only ever terminate itself. The
 on-pod credential lives on tmpfs (`/dev/shm`, RAM only) and is `shred`ded after the
@@ -212,12 +226,14 @@ podtrack does about each:
 | Registry is per-machine, not per-account | documented; `PODTRACK_HOME` for shared placement (see Storage) |
 | SSH ops fail silently → a busy pod drifts into a dead-man kill | retry + backoff + warning on all SSH; a failed pet on a busy pod raises an alert |
 | API key in a URL query string leaks to logs/proxies | `Authorization: Bearer` header everywhere |
+| Pods on a second RunPod account are invisible to leak detection | per-account key custody; reconcile/reap/sweep cover every configured account each cycle; `register` refuses an account with no key; a failed per-account fetch skips only that account's vanish sweep |
 
 ## Storage
 
 - **Registry DB:** `~/.local/share/podtrack/pods.db` (override with `$PODTRACK_HOME`).
   Holds a `pods` table plus an append-only `events` audit log.
-- **Credential:** `~/.config/podtrack/runpod.key` (after `adopt-key`).
+- **Credentials:** `~/.config/podtrack/runpod.key` (account `main`) and
+  `~/.config/podtrack/runpod.<account>.key` per additional account (after `adopt-key`).
 
 `PODTRACK_HOME` can point the registry at a shared path to coordinate multiple machines,
 but SQLite's WAL journal is unsafe over NFS/network filesystems — use a single always-on
