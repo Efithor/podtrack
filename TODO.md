@@ -46,3 +46,36 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
 - [ ] Live-fire test of an actual dead-man FIRE (let a throwaway cheap pod's
   deadline lapse with the host machine "asleep" and confirm terminate + confirm-gone
   loop + volume survival).
+
+## 2026-08-07 — Incident: #12 untracked-reap killed a coworker's pods (pro account)
+
+Overnight Aug 6→7 the reaper auto-terminated three untracked RTX PRO 6000 pods
+($4.18/h) on 'pro' — they belonged to a coworker (accounts are per-team, not
+per-person). The coworker purged ALL API keys on the account at 12:21 CDT in
+response; podtrack lost access (401s from 12:26).
+
+Fixed same day: `shared_accounts()` reading `~/.config/podtrack/shared-accounts`
+('pro' listed) — untracked pods on shared accounts are warn-only in reap (#12)
+and refused in `reconcile --terminate-untracked`. Failure-mode register
+addendum: #12's premise ("every deploy registers") only holds for accounts
+where podtrack-driven automation is the ONLY user. Follow-ups:
+- [ ] adopt new pro key once minted (`podtrack adopt-key --account pro`) —
+      verify shared-accounts guard logs the NOTE path on first reap afterwards
+- [ ] consider defaulting NEW accounts to shared until explicitly marked solo
+
+## 2026-08-07 (pm) — Provenance stamping (PODTRACK_STAMP) shipped
+
+Kyle's spec after the coworker incident: pods need forced creation-time
+metadata so ownership is provable, prefix-free. Implemented via an env var
+(env is immutable post-deploy and returned by the pod query — the strongest
+per-pod marker RunPod offers; it has no first-class label/tag API):
+- runpod_deploy.py injects PODTRACK_STAMP=<label>@<host> at creation
+- fetch_remote_pods() requests env, exposes `stamped`
+- reconcile: unknown+stamped -> UNTRACKED (our leak, reapable);
+  unknown+unstamped -> FOREIGN/NOT-OURS row, logged once, NEVER auto-touched
+  (excluded from #12, idle-kill, and terminate_untracked)
+- reap #12: stamp is the authority — stamped rows reap on ANY account;
+  shared-accounts file now only brakes LEGACY unknown rows (no stamp proof)
+- offline test: scratchpad test_stamp_logic2.py (3 paths, ALL PASS 2026-08-07)
+- [ ] first real-pod validation: after next deploy, `podtrack probe` the pod
+      and confirm reconcile shows it stamped; then delete this line

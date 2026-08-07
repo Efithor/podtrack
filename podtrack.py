@@ -148,6 +148,31 @@ def configured_accounts() -> list[str]:
     return accts
 
 
+# Creation-time provenance stamp. runpod_deploy.py injects this env var into
+# every pod it creates; env is immutable after deploy and returned by the pod
+# query, so presence of the key is PROOF a pod came from our tooling. Unstamped
+# pods are FOREIGN (a coworker's / other tooling): reconcile records them as
+# such and nothing ever tears them down automatically.
+STAMP_ENV_KEY = "PODTRACK_STAMP"
+
+SHARED_ACCTS_PATH = CRED_DIR / "shared-accounts"
+
+
+def shared_accounts() -> set[str]:
+    """Accounts other people also use (one name per line in
+    ~/.config/podtrack/shared-accounts). On these, an untracked pod is
+    presumed to be a COWORKER'S, not our leak: failure-mode #12's auto-reap
+    is disabled and reconcile's terminate_untracked is refused.
+
+    Incident that mandated this (2026-08-07): the reaper killed three
+    untracked RTX PRO 6000 pods on 'pro' overnight — they were a coworker's;
+    the coworker responded by purging every API key on the account."""
+    if not SHARED_ACCTS_PATH.exists():
+        return set()
+    return {ln.strip() for ln in SHARED_ACCTS_PATH.read_text().splitlines()
+            if ln.strip() and not ln.strip().startswith("#")}
+
+
 def adopt_key(account: str = "main", source: str | None = None) -> str:
     cred = _cred_path(account)
     CRED_DIR.mkdir(parents=True, exist_ok=True)
@@ -224,7 +249,7 @@ def gql(query: str, variables: dict | None = None, account: str = "main") -> dic
 
 def fetch_remote_pods(account: str = "main") -> list[dict]:
     q = """query { myself { pods {
-        id name desiredStatus costPerHr
+        id name desiredStatus costPerHr env
         machine { gpuDisplayName }
         runtime { uptimeInSeconds gpus { id gpuUtilPercent }
                   ports { ip publicPort privatePort type } } } } }"""
@@ -237,13 +262,24 @@ def fetch_remote_pods(account: str = "main") -> list[dict]:
         for port in (rt.get("ports") or []):
             if port.get("privatePort") == 22:
                 ssh_ip, ssh_port = port.get("ip"), port.get("publicPort")
+        # env comes back as ["KEY=value", ...] (or {key,value} dicts on some
+        # schema versions) — presence of STAMP_ENV_KEY proves our tooling
+        # created this pod (see STAMP_ENV_KEY comment).
+        stamped = False
+        for e in (p.get("env") or []):
+            key = (e.get("key") if isinstance(e, dict)
+                   else str(e).split("=", 1)[0])
+            if key == STAMP_ENV_KEY:
+                stamped = True
+                break
         norm.append({
             "pod_id": p.get("id"), "name": p.get("name"),
             "desired": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
             "gpu_type": (p.get("machine") or {}).get("gpuDisplayName"),
             "n_gpus": len(gpus), "uptime_s": rt.get("uptimeInSeconds"),
             "gpu_util": max((g.get("gpuUtilPercent") or 0) for g in gpus) if gpus else None,
-            "ssh_ip": ssh_ip, "ssh_port": ssh_port, "account": account})
+            "ssh_ip": ssh_ip, "ssh_port": ssh_port, "account": account,
+            "stamped": stamped})
     return norm
 
 
@@ -786,16 +822,35 @@ class Registry:
                          rp["ssh_ip"], rp["ssh_port"], rp["gpu_util"],
                          _ts() if rp["n_gpus"] else None, acct, pid))
                     s["live"].append(pid)
-                else:
+                elif rp.get("stamped"):
+                    # Carries our creation stamp but is in no tracked session:
+                    # provably OUR leak (deploy died before register) -> reapable.
                     self.db.execute(
                         "INSERT OR IGNORE INTO pods(pod_id,owner_uuid,owner_label,gpu_type,"
                         "ssh_ip,ssh_port,status,cost_per_hr,deployed_at,notes,account) "
                         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (pid, "UNKNOWN", "UNTRACKED", rp["gpu_type"], rp["ssh_ip"],
                          rp["ssh_port"], "untracked", rp["cost_per_hr"], _ts(),
-                         "discovered by reconcile", acct))
+                         "discovered by reconcile (stamped=ours)", acct))
                     s["untracked"].append(pid)
-                    self._log(pid, "reconcile", f"found untracked/leaked pod [{acct}]")
+                    self._log(pid, "reconcile", f"found untracked/leaked STAMPED pod [{acct}]")
+                else:
+                    # No stamp -> NOT created by our tooling (coworker / other
+                    # tooling / attacker). Record as foreign; NOTHING may ever
+                    # auto-terminate it. (2026-08-07 incident.)
+                    cur = self.db.execute(
+                        "INSERT OR IGNORE INTO pods(pod_id,owner_uuid,owner_label,gpu_type,"
+                        "ssh_ip,ssh_port,status,cost_per_hr,deployed_at,notes,account) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (pid, "FOREIGN", "NOT-OURS", rp["gpu_type"], rp["ssh_ip"],
+                         rp["ssh_port"], "foreign", rp["cost_per_hr"], _ts(),
+                         "unstamped pod discovered by reconcile — hands off", acct))
+                    s.setdefault("foreign", []).append(pid)
+                    if cur.rowcount:               # log once, on first discovery
+                        print(f"# NOTE: foreign (unstamped) pod {pid} on '{acct}' "
+                              f"({rp['gpu_type']}, ${rp['cost_per_hr']}/h) — not ours, "
+                              f"will not be touched.", file=sys.stderr)
+                        self._log(pid, "reconcile", f"foreign unstamped pod [{acct}]")
             # #11 vanished-guard, PER ACCOUNT: a truncated/partial fetch must not mark
             # live pods gone (that hides a still-billing pod as an un-reapable
             # "terminated" leak). 0 pods returned while the registry believes this
@@ -821,6 +876,9 @@ class Registry:
                     self._log(pid, "vanish-strike", f"{vs}/2 (absent this fetch)")
         self.db.commit()
         if terminate_untracked:
+            # s["untracked"] only ever contains STAMPED pods (provably ours;
+            # unstamped go to s["foreign"] and are untouchable), so no
+            # shared-account refusal is needed here.
             for pid in s["untracked"]:
                 self.teardown(pid, force=True, skip_pull=True)
         return s
@@ -877,10 +935,23 @@ class Registry:
         now = _now()
 
         # #12: auto-terminate untracked pods (owner UNKNOWN) older than the grace.
+        # The PODTRACK_STAMP env marker is the authority: rows recorded with
+        # stamped provenance are provably OUR leaks -> reapable on ANY account.
+        # Rows WITHOUT stamped provenance (legacy, pre-stamp) on a SHARED
+        # account (see shared_accounts()) might be a coworker's: warn-only.
+        # Unstamped remote pods never become UNKNOWN rows at all (-> FOREIGN).
+        shared = shared_accounts()
         for pod in self.list_pods("all"):
             if pod["owner_uuid"] != "UNKNOWN" or pod["status"] not in LIVE_STATUSES + ("untracked",):
                 continue
             pid = pod["pod_id"]
+            stamped_row = "(stamped=ours)" in (pod["notes"] or "")
+            if not stamped_row and self._acct(pod) in shared:
+                print(f"# NOTE: untracked UNSTAMPED-era pod {pid} on SHARED account "
+                      f"'{self._acct(pod)}' — not reaping (could be a coworker's).",
+                      file=sys.stderr)
+                report["kept"].append((pid, "untracked (shared account, no stamp proof)"))
+                continue
             dep = _parse(pod["deployed_at"])
             if dep is None or (now - dep) < timedelta(minutes=untracked_grace_min):
                 report["kept"].append((pid, "untracked (within grace)"))
@@ -892,8 +963,8 @@ class Registry:
                 report["kept"].append((pid, f"untracked-refused: {str(e)[:50]}"))
 
         for pod in self.list_pods("all"):
-            if pod["status"] != "running" or pod["owner_uuid"] == "UNKNOWN":
-                continue                          # untracked handled above
+            if pod["status"] != "running" or pod["owner_uuid"] in ("UNKNOWN", "FOREIGN"):
+                continue                          # untracked handled above; FOREIGN never managed
             pid = pod["pod_id"]
             if mirror and pod["remote_path"]:
                 ok, _ = self.sync(pid)

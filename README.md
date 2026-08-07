@@ -58,6 +58,28 @@ export PODTRACK_LABEL=my-job
 export PODTRACK_OWNER_UUID=$(uuidgen)   # optional; a stable value is persisted if unset
 ```
 
+### Provenance stamping (whose pod is this, really?)
+
+Registry ownership answers "which *session* owns this pod" — but on an account other
+**people** also use, the prior question is "did our tooling create this pod at all?"
+podtrack answers it with a creation-time env marker: deploy tooling injects
+`PODTRACK_STAMP=<label>@<host>` into every pod it creates. Pod env is immutable after
+deploy and returned by the pod query, so the stamp is provenance, not convention (a
+name prefix can collide or be edited; env can't).
+
+Reconcile then classifies every unknown live pod:
+
+- **stamped + untracked** → provably *our* leak (a deploy died before `register`);
+  eligible for the reaper's untracked sweep, on any account.
+- **unstamped** → **FOREIGN**: someone else's pod. Recorded (`owner NOT-OURS`), logged
+  once, and excluded from every automatic action — the untracked sweep, idle-kill, and
+  `reconcile --terminate-untracked` all skip it. Nothing in podtrack will ever
+  terminate a pod it can't prove it created.
+
+For accounts shared with other humans, list them (one name per line) in
+`~/.config/podtrack/shared-accounts`: legacy unknown rows *without* stamp proof on
+those accounts get warn-only treatment instead of the sweep.
+
 ## Commands
 
 ```bash
@@ -226,7 +248,8 @@ podtrack does about each:
 | Teardown silently skips the artifact pull when no path was registered | loud warning on artifact-less teardown of pods older than an hour; `--no-artifacts` to opt out |
 | Network volume silently unmounts (data-center mismatch) → artifacts land on ephemeral disk | per-job volume created in a DC that has the GPU, pod pinned there, mount verified or abort |
 | A partial API response marks live pods "terminated" (invisible leak) | a pod is only marked gone after two consecutive absent fetches; a 0-pod response with known-live pods skips the sweep |
-| Leaked/untracked pods bill until a human notices | reaper auto-terminates untracked pods older than a configurable grace |
+| Leaked/untracked pods bill until a human notices | reaper auto-terminates untracked pods older than a configurable grace — but only pods carrying our `PODTRACK_STAMP` creation marker |
+| A coworker's pod on a shared account looks like "our leak" → reaper destroys their work | provenance stamping: unstamped pods are FOREIGN — recorded, surfaced, and never auto-terminated; `shared-accounts` adds a warn-only brake for legacy stampless rows |
 | Registry is per-machine, not per-account | documented; `PODTRACK_HOME` for shared placement (see Storage) |
 | SSH ops fail silently → a busy pod drifts into a dead-man kill | retry + backoff + warning on all SSH; a failed pet on a busy pod raises an alert |
 | API key in a URL query string leaks to logs/proxies | `Authorization: Bearer` header everywhere |
