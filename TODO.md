@@ -54,4 +54,3 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
 - [ ] On-pod heartbeat writers should self-terminate with their job (a writer
   that outlives its job vetoes the idle-reap of a finished pod).
 
-Incident history and its dated journal live outside this repo.

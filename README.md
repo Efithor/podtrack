@@ -140,9 +140,9 @@ utilization is only the fallback signal for pods that emit no heartbeat.
 when strikes say "kill", the reaper interrogates the pod itself — **six `nvidia-smi`
 samples over ~5 s plus device `memory.used`**. Any nonzero utilization sample OR ≥1 GiB
 resident device memory vetoes the kill and resets strikes with a loud ALERT. Why both:
-`utilization.gpu` is bursty — a healthy launch-bound MD job measured samples of
-100, 30, 0, 0, 0, 0, 0, 100 in sequence, so single samples (including the RunPod API's)
-are coin flips on gappy workloads — while resident memory is steady for any live job and
+`utilization.gpu` is bursty — launch-bound workloads legitimately produce long runs of
+zero samples while fully busy (sequences like 100, 30, 0, 0, 0, 0, 0, 100), so single
+samples (including the RunPod API's) are coin flips — while resident memory is steady for any live job and
 visible through container PID namespaces (unlike `--query-compute-apps`). Unreachable →
 deferred to the unreachable-escalation path. Only "all samples 0 AND <1 GiB resident,
 confirmed over SSH" proceeds. TTL kills are unaffected — the cost backstop stays

@@ -585,7 +585,7 @@ class Registry:
     def _launch_deadman(self, pod):
         """Launch the supervisor detached. Idempotent (skips if one already runs),
         so a retry after an ambiguous first attempt cannot stack duplicates.
-        ⚠ On some pods (observed: A100 secure cloud) the SSH channel fails to
+        ⚠ On some pods the SSH channel fails to
         close after a successful detached launch, so rc=255 here means UNKNOWN,
         not failed — _deadman_alive() is the only authoritative signal. The
         trailing `exec 1>&- 2>&-` releases the session's pipes so sshd can
