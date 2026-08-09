@@ -985,6 +985,17 @@ class Registry:
                 ok, _ = self.sync(pid)
                 if ok:
                     report["mirrored"].append(pid)
+                else:
+                    # A silently-failing mirror re-creates the exact data hole
+                    # the artifact-spec requirement exists to close (found
+                    # 2026-08-09: image without rsync -> mirrored=0 for hours,
+                    # zero noise). Fail LOUD every cycle until fixed.
+                    print(f"# WARN: mirror FAILED for {pid} "
+                          f"({pod['remote_path']} -> {pod['local_path']}) — "
+                          f"artifacts are NOT being protected. Common cause: "
+                          f"rsync missing on the pod (apt-get install rsync).",
+                          file=sys.stderr)
+                    report["kept"].append((pid, "mirror-FAILED"))
             reachable = self._read_remote_heartbeat(pod)
             sfs = 0 if reachable else (pod["ssh_fail_streak"] or 0) + 1
             self.db.execute("UPDATE pods SET ssh_fail_streak=? WHERE pod_id=?", (sfs, pid))
