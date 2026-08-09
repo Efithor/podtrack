@@ -1,7 +1,6 @@
 # podtrack — TODO
 
-Deferred improvements from the 2026-07-05 live-fire session (the first real
-exercise of v0.3 on a paid pod). The P0 items from that session are already in
+Deferred improvements from live-fire operation. The P0 items are already in
 `podtrack.py` (data-guard on volume delete, stdin-detached deadman launches,
 ConnectTimeout 30, noexec-safe `bash` invocation).
 
@@ -15,9 +14,9 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
   pet-freshness against `deadman_deadline`.
 
 - [ ] **Split `arm`'s install into short piecewise SSH calls** (write scripts →
-  write state → launch → verify). Some pods' sshd (observed: EU-RO-1 A100 under
-  load) reliably chokes on long compound commands while short ones work; arm's
-  single giant heredoc is the most fragile command we send.
+  write state → launch → verify). Some pods' sshd reliably chokes on long
+  compound commands while short ones work; arm's single giant heredoc is the
+  most fragile command we send.
 
 ## P1 — docs / operational footguns (README section)
 
@@ -27,13 +26,17 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
   `pkill -f "patt[e]rn"`. (podtrack's own `_deadman_alive` already does this.)
 
 - [ ] **Idempotent job launches**: retried SSH launch attempts can be *queued*,
-  not lost — when a wedged sshd recovers, all of them execute and race (observed:
-  six concurrent chains fighting over one GPU). Job launches must be guarded
-  (pidfile + `kill -0`, or `flock`) so a duplicate exits immediately.
+  not lost — when a wedged sshd recovers, all of them execute and race. Job
+  launches must be guarded (pidfile + `kill -0`, or `flock`) so a duplicate
+  exits immediately.
 
 - [ ] **Session-hang pattern**: a backgrounded remote child that inherits the
   SSH session's stdin/stdout keeps the session open until timeout. Launch
   detached jobs with `setsid nohup ... </dev/null >log 2>&1 &`.
+
+- [ ] **Ensure rsync on the pod image** at deploy/bootstrap — the mirror
+  depends on it, and minimal images omit it (the reaper now WARNs loudly
+  every cycle when a mirror fails).
 
 ## P2 / later
 
@@ -44,58 +47,11 @@ ConnectTimeout 30, noexec-safe `bash` invocation).
 - [ ] Registry `terminate_after` column mirroring the RunPod-side TTL set at
   deploy, so `list` shows the true outermost backstop.
 - [ ] Live-fire test of an actual dead-man FIRE (let a throwaway cheap pod's
-  deadline lapse with the host machine "asleep" and confirm terminate + confirm-gone
-  loop + volume survival).
+  deadline lapse with the host machine "asleep" and confirm terminate +
+  confirm-gone loop + volume survival).
+- [ ] Expose `register --update` for artifact-path edits instead of raw sqlite.
+- [ ] Consider defaulting NEW accounts to shared until explicitly marked solo.
+- [ ] On-pod heartbeat writers should self-terminate with their job (a writer
+  that outlives its job vetoes the idle-reap of a finished pod).
 
-## 2026-08-07 — Incident: #12 untracked-reap killed a coworker's pods (pro account)
-
-Overnight Aug 6→7 the reaper auto-terminated three untracked RTX PRO 6000 pods
-($4.18/h) on 'pro' — they belonged to a coworker (accounts are per-team, not
-per-person). The coworker purged ALL API keys on the account at 12:21 CDT in
-response; podtrack lost access (401s from 12:26).
-
-Fixed same day: `shared_accounts()` reading `~/.config/podtrack/shared-accounts`
-('pro' listed) — untracked pods on shared accounts are warn-only in reap (#12)
-and refused in `reconcile --terminate-untracked`. Failure-mode register
-addendum: #12's premise ("every deploy registers") only holds for accounts
-where podtrack-driven automation is the ONLY user. Follow-ups:
-- [ ] adopt new pro key once minted (`podtrack adopt-key --account pro`) —
-      verify shared-accounts guard logs the NOTE path on first reap afterwards
-- [ ] consider defaulting NEW accounts to shared until explicitly marked solo
-
-## 2026-08-07 (pm) — Provenance stamping (PODTRACK_STAMP) shipped
-
-Kyle's spec after the coworker incident: pods need forced creation-time
-metadata so ownership is provable, prefix-free. Implemented via an env var
-(env is immutable post-deploy and returned by the pod query — the strongest
-per-pod marker RunPod offers; it has no first-class label/tag API):
-- runpod_deploy.py injects PODTRACK_STAMP=<label>@<host> at creation
-- fetch_remote_pods() requests env, exposes `stamped`
-- reconcile: unknown+stamped -> UNTRACKED (our leak, reapable);
-  unknown+unstamped -> FOREIGN/NOT-OURS row, logged once, NEVER auto-touched
-  (excluded from #12, idle-kill, and terminate_untracked)
-- reap #12: stamp is the authority — stamped rows reap on ANY account;
-  shared-accounts file now only brakes LEGACY unknown rows (no stamp proof)
-- offline test: scratchpad test_stamp_logic2.py (3 paths, ALL PASS 2026-08-07)
-- [x] first real-pod validation DONE 2026-08-08: pod 5ojchk7s4ahqe0 (pro,
-      mace-a100-bench) — PODTRACK_STAMP round-tripped through the live pod
-      query as ["KEY=value"] strings; parser's string branch exercised
-
-## 2026-08-09 — Incident: reaper idle-killed its own team's BUSY campaign pod
-
-Pod 7x8qf6eziw07cv (ti2mnfe-rebracket, A100 pro) was running a 10h batched MD
-campaign at GPU 99-100%; the reaper idle-killed it 4.8h in ("idle x3" — RunPod
-API gpu_util reported 0 for 3+ consecutive reconciles) and, because the pod was
-registered with NO artifact spec, pulled nothing. ~$7.60 and the partial run lost.
-Root causes, all process: (1) no job heartbeat during a long run — the exact
-veto mechanism #7 provides; (2) no remote_path/local_path at register, so the
-per-cycle mirror never ran; (3) unclear whether gpu_util=0 was a mid-run crash
-or RunPod telemetry false-zero — evidence died with the pod.
-- [x] relaunch protocol (applied to 8dy5vflq54wzpb): register artifact spec
-      immediately; host-side job-heartbeat loop every 5 min while job lives;
-      driver writes partial_results.json every sample so mirrors are useful
-- [x] runpod_deploy.py now defaults remote_path=/workspace/out + local_path
-      for every pod (register would refuse otherwise) — DONE 2026-08-09
-- [x] podtrack 0.6.0: idle-kill requires SSH nvidia-smi confirmation (veto +
-      strike reset on mismatch; deferred when unreachable) — DONE 2026-08-09
-- [ ] podtrack: expose `register --update` instead of raw sqlite for path edits
+Incident history and its dated journal live outside this repo.

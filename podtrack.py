@@ -151,7 +151,7 @@ def configured_accounts() -> list[str]:
 # Creation-time provenance stamp. runpod_deploy.py injects this env var into
 # every pod it creates; env is immutable after deploy and returned by the pod
 # query, so presence of the key is PROOF a pod came from our tooling. Unstamped
-# pods are FOREIGN (a coworker's / other tooling): reconcile records them as
+# pods are FOREIGN (another user or other tooling): reconcile records them as
 # such and nothing ever tears them down automatically.
 STAMP_ENV_KEY = "PODTRACK_STAMP"
 
@@ -161,12 +161,10 @@ SHARED_ACCTS_PATH = CRED_DIR / "shared-accounts"
 def shared_accounts() -> set[str]:
     """Accounts other people also use (one name per line in
     ~/.config/podtrack/shared-accounts). On these, an untracked pod is
-    presumed to be a COWORKER'S, not our leak: failure-mode #12's auto-reap
-    is disabled and reconcile's terminate_untracked is refused.
-
-    Incident that mandated this (2026-08-07): the reaper killed three
-    untracked RTX PRO 6000 pods on 'pro' overnight — they were a coworker's;
-    the coworker responded by purging every API key on the account."""
+    presumed to be someone else's work, not our leak: failure-mode #12's
+    auto-reap is disabled and reconcile's terminate_untracked is refused.
+    Terminating another person's pod destroys their work and erodes the
+    trust the shared account depends on."""
     if not SHARED_ACCTS_PATH.exists():
         return set()
     return {ln.strip() for ln in SHARED_ACCTS_PATH.read_text().splitlines()
@@ -180,7 +178,7 @@ def adopt_key(account: str = "main", source: str | None = None,
     if cred.exists() and not force:
         # Refuse LOUDLY (nonzero): a caller chaining `adopt-key && rm src`
         # must not destroy the only copy of a NEW key because an OLD one
-        # occupied the slot (2026-08-08 lesson). --force replaces (key rotation).
+        # occupied the slot. --force replaces (key rotation).
         raise SystemExit(f"REFUSED: key already in custody at {cred}. "
                          f"Rotating? Re-run with --force to replace it.")
     src = (Path(source).expanduser() if source
@@ -237,7 +235,7 @@ def gql(query: str, variables: dict | None = None, account: str = "main") -> dic
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
     # #15: send the key in an Authorization header, NOT the URL query string, so it
     # can't leak into access logs / proxies / crash traces. RunPod accepts
-    # `Authorization: Bearer <key>` (confirmed 2026-07-05).
+    # `Authorization: Bearer <key>`.
     req = urllib.request.Request(
         RUNPOD_API, data=body,
         headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (podtrack)",
@@ -294,7 +292,7 @@ def terminate_remote(pod_id: str, account: str = "main"):
 
 
 # ---- ephemeral network-volume lifecycle (failure mode #10 / policy P-2) ----
-# Schema confirmed empirically against api.runpod.io 2026-07-05 (introspection is
+# Schema confirmed empirically against api.runpod.io (introspection is
 # disabled server-side; verified via query-validation probes):
 #   createNetworkVolume(input:{name,size,dataCenterId!}) -> NetworkVolume{id name size dataCenterId}
 #   deleteNetworkVolume(input:{id!})
@@ -480,9 +478,10 @@ class Registry:
                 f"account '{account}' has no key in custody (configured: "
                 f"{configured_accounts() or 'NONE'}). Run `podtrack adopt-key "
                 f"--account {account} --from PATH` first.")
-        # Artifact spec is REQUIRED (2026-08-09 incident: an artifactless pod
-        # was torn down mid-campaign and its outputs were unrecoverable). A pod
-        # with no declared outputs must say so explicitly via no_artifacts.
+        # Artifact spec is REQUIRED: without one, teardown pull-verify and
+        # the reaper's per-cycle mirror never engage, and a teardown destroys
+        # the only copy of the pod's outputs. A pod with no outputs worth
+        # keeping must say so explicitly via no_artifacts.
         if not no_artifacts and not (remote_path and local_path):
             raise SystemExit(
                 "REFUSED: register requires an artifact spec — pass both "
@@ -734,7 +733,7 @@ class Registry:
     def _delete_volume(self, pod, pull_verified=False):
         """Delete a pod's ephemeral network volume after teardown (P-1/P-2). Best-
         effort but LOUD on failure — a leaked volume bills storage indefinitely.
-        DATA GUARD (2026-07-05): if the pod declared artifacts (remote_path) and
+        DATA GUARD: if the pod declared artifacts (remote_path) and
         this teardown did NOT verify a pull, the volume is the ONLY copy of the
         data — keep it (it bills; sweep manually after rescuing the artifacts)."""
         vid = pod.get("volume_id")
@@ -850,9 +849,9 @@ class Registry:
                     s["untracked"].append(pid)
                     self._log(pid, "reconcile", f"found untracked/leaked STAMPED pod [{acct}]")
                 else:
-                    # No stamp -> NOT created by our tooling (coworker / other
-                    # tooling / attacker). Record as foreign; NOTHING may ever
-                    # auto-terminate it. (2026-08-07 incident.)
+                    # No stamp -> NOT created by our tooling (another user,
+                    # other tooling, or an intruder). Record as foreign;
+                    # NOTHING may ever auto-terminate it.
                     cur = self.db.execute(
                         "INSERT OR IGNORE INTO pods(pod_id,owner_uuid,owner_label,gpu_type,"
                         "ssh_ip,ssh_port,status,cost_per_hr,deployed_at,notes,account) "
@@ -953,7 +952,7 @@ class Registry:
         # The PODTRACK_STAMP env marker is the authority: rows recorded with
         # stamped provenance are provably OUR leaks -> reapable on ANY account.
         # Rows WITHOUT stamped provenance (legacy, pre-stamp) on a SHARED
-        # account (see shared_accounts()) might be a coworker's: warn-only.
+        # account (see shared_accounts()) might be someone else's: warn-only.
         # Unstamped remote pods never become UNKNOWN rows at all (-> FOREIGN).
         shared = shared_accounts()
         for pod in self.list_pods("all"):
@@ -963,7 +962,7 @@ class Registry:
             stamped_row = "(stamped=ours)" in (pod["notes"] or "")
             if not stamped_row and self._acct(pod) in shared:
                 print(f"# NOTE: untracked UNSTAMPED-era pod {pid} on SHARED account "
-                      f"'{self._acct(pod)}' — not reaping (could be a coworker's).",
+                      f"'{self._acct(pod)}' — not reaping (may be someone else's).",
                       file=sys.stderr)
                 report["kept"].append((pid, "untracked (shared account, no stamp proof)"))
                 continue
@@ -986,9 +985,9 @@ class Registry:
                 if ok:
                     report["mirrored"].append(pid)
                 else:
-                    # A silently-failing mirror re-creates the exact data hole
-                    # the artifact-spec requirement exists to close (found
-                    # 2026-08-09: image without rsync -> mirrored=0 for hours,
+                    # A silently-failing mirror re-creates the exact data
+                    # hole the artifact-spec requirement exists to close
+                    # (e.g. an image without rsync fails every cycle with
                     # zero noise). Fail LOUD every cycle until fixed.
                     print(f"# WARN: mirror FAILED for {pid} "
                           f"({pod['remote_path']} -> {pod['local_path']}) — "
@@ -1044,15 +1043,15 @@ class Registry:
                     report["kept"].append((pid, "ttl-grace pet FAILED (busy, unreachable)"))
                 continue
 
-            # 2026-08-09 enforcement: NEVER idle-kill on API telemetry alone.
-            # RunPod's gpu_util reported 0% for a pod running at 100% (campaign
-            # incident); the kill needs the pod's own nvidia-smi to concur.
+            # NEVER idle-kill on API telemetry alone: the provider's
+            # gpu_util metric can report 0% for a busy pod; the kill needs
+            # the pod's own nvidia-smi to concur.
             # Unreachable pods are NOT idle-killed here — the unreachable
             # escalation path (#8) owns that case.
             if idle_kill and not (abs_expired or ttl_expired):
-                # utilization.gpu is bursty: a healthy launch-bound MD job
-                # measured 100,30,0,0,0,0,0,100 across consecutive samples
-                # (2026-08-09), so a single sample is a coin flip. Verdict =
+                # utilization.gpu is bursty: launch-bound jobs can return
+                # runs of consecutive zero samples while fully busy, so a
+                # single sample is a coin flip. Verdict =
                 # six samples (any nonzero -> busy) PLUS device memory: a live
                 # job holds GBs at the device level (visible through container
                 # PID namespaces, unlike compute-apps); a dead process frees it.

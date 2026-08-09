@@ -264,7 +264,7 @@ podtrack does about each:
 | Network volume silently unmounts (data-center mismatch) → artifacts land on ephemeral disk | per-job volume created in a DC that has the GPU, pod pinned there, mount verified or abort |
 | A partial API response marks live pods "terminated" (invisible leak) | a pod is only marked gone after two consecutive absent fetches; a 0-pod response with known-live pods skips the sweep |
 | Leaked/untracked pods bill until a human notices | reaper auto-terminates untracked pods older than a configurable grace — but only pods carrying our `PODTRACK_STAMP` creation marker |
-| A coworker's pod on a shared account looks like "our leak" → reaper destroys their work | provenance stamping: unstamped pods are FOREIGN — recorded, surfaced, and never auto-terminated; `shared-accounts` adds a warn-only brake for legacy stampless rows |
+| Another user's pod on a shared account looks like "our leak" → reaper destroys their work | provenance stamping: unstamped pods are FOREIGN — recorded, surfaced, and never auto-terminated; `shared-accounts` adds a warn-only brake for legacy stampless rows |
 | Registry is per-machine, not per-account | documented; `PODTRACK_HOME` for shared placement (see Storage) |
 | SSH ops fail silently → a busy pod drifts into a dead-man kill | retry + backoff + warning on all SSH; a failed pet on a busy pod raises an alert |
 | API key in a URL query string leaks to logs/proxies | `Authorization: Bearer` header everywhere |
