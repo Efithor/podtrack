@@ -1039,26 +1039,40 @@ class Registry:
             # Unreachable pods are NOT idle-killed here — the unreachable
             # escalation path (#8) owns that case.
             if idle_kill and not (abs_expired or ttl_expired):
+                # utilization.gpu is bursty: a healthy launch-bound MD job
+                # measured 100,30,0,0,0,0,0,100 across consecutive samples
+                # (2026-08-09), so a single sample is a coin flip. Verdict =
+                # six samples (any nonzero -> busy) PLUS device memory: a live
+                # job holds GBs at the device level (visible through container
+                # PID namespaces, unlike compute-apps); a dead process frees it.
                 rc, out, _ = ssh_run(
-                    pod, "nvidia-smi --query-gpu=utilization.gpu "
-                         "--format=csv,noheader,nounits", timeout=25)
-                util = None
+                    pod, "for i in 1 2 3 4 5 6; do nvidia-smi "
+                         "--query-gpu=utilization.gpu,memory.used "
+                         "--format=csv,noheader,nounits; sleep 0.8; done",
+                    timeout=40)
+                max_util = mem_mib = None
                 if rc == 0:
                     try:
-                        util = max(int(x) for x in out.split())
-                    except ValueError:
+                        rows = [tuple(int(v) for v in ln.split(","))
+                                for ln in out.strip().splitlines() if "," in ln]
+                        max_util = max(r[0] for r in rows)
+                        mem_mib = max(r[1] for r in rows)
+                    except (ValueError, IndexError):
                         pass
-                if rc == 0 and util is not None and util >= 5:
+                if rc == 0 and max_util is not None and (
+                        max_util > 0 or mem_mib >= 1024):
                     print(f"# ALERT: {pid} API-idle x{strikes} but on-pod "
-                          f"nvidia-smi shows {util}% — telemetry mismatch; NOT "
-                          f"killing; strikes reset.", file=sys.stderr)
-                    self._log(pid, "idle-veto", f"nvidia-smi {util}% vs API 0")
+                          f"nvidia-smi shows util<={max_util}% mem={mem_mib}MiB "
+                          f"— NOT killing; strikes reset.", file=sys.stderr)
+                    self._log(pid, "idle-veto",
+                              f"nvidia-smi util{max_util}%/mem{mem_mib}MiB vs API 0")
                     self.db.execute(
                         "UPDATE pods SET idle_strikes=0 WHERE pod_id=?", (pid,))
                     self.db.commit()
-                    report["kept"].append((pid, f"idle-veto: nvidia-smi {util}%"))
+                    report["kept"].append(
+                        (pid, f"idle-veto: util{max_util}%/mem{mem_mib}MiB"))
                     continue
-                if rc != 0:
+                if rc != 0 or max_util is None:
                     report["kept"].append(
                         (pid, "idle but ssh-unverifiable — deferred to "
                               "unreachable escalation"))

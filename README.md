@@ -136,11 +136,17 @@ utilization (from the RunPod API, or a definitive SSH `nvidia-smi` via `podtrack
 **and** a job heartbeat. A fresh heartbeat zeroes the idle strikes outright; GPU
 utilization is only the fallback signal for pods that emit no heartbeat.
 
-**An idle-kill is never executed on API telemetry alone** (as of 0.6.0): when strikes
-say "kill", the reaper first asks the pod's own `nvidia-smi` over SSH. Busy → veto,
-strikes reset, loud ALERT (RunPod's API has reported 0% for a pod running at 100%).
-Unreachable → deferred to the unreachable-escalation path. Only an SSH-confirmed 0%
-proceeds. TTL kills are unaffected — the cost backstop stays absolute.
+**An idle-kill is never executed on API telemetry alone** (0.6.0, hardened in 0.6.1):
+when strikes say "kill", the reaper interrogates the pod itself — **six `nvidia-smi`
+samples over ~5 s plus device `memory.used`**. Any nonzero utilization sample OR ≥1 GiB
+resident device memory vetoes the kill and resets strikes with a loud ALERT. Why both:
+`utilization.gpu` is bursty — a healthy launch-bound MD job measured samples of
+100, 30, 0, 0, 0, 0, 0, 100 in sequence, so single samples (including the RunPod API's)
+are coin flips on gappy workloads — while resident memory is steady for any live job and
+visible through container PID namespaces (unlike `--query-compute-apps`). Unreachable →
+deferred to the unreachable-escalation path. Only "all samples 0 AND <1 GiB resident,
+confirmed over SSH" proceeds. TTL kills are unaffected — the cost backstop stays
+absolute.
 
 A hard `kill_after` TTL still fires regardless of activity — it's the cost backstop that
 doesn't depend on idle detection at all. **Always set one** at deploy
