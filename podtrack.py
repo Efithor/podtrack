@@ -173,11 +173,16 @@ def shared_accounts() -> set[str]:
             if ln.strip() and not ln.strip().startswith("#")}
 
 
-def adopt_key(account: str = "main", source: str | None = None) -> str:
+def adopt_key(account: str = "main", source: str | None = None,
+              force: bool = False) -> str:
     cred = _cred_path(account)
     CRED_DIR.mkdir(parents=True, exist_ok=True)
-    if cred.exists():
-        return f"already adopted: {cred}"
+    if cred.exists() and not force:
+        # Refuse LOUDLY (nonzero): a caller chaining `adopt-key && rm src`
+        # must not destroy the only copy of a NEW key because an OLD one
+        # occupied the slot (2026-08-08 lesson). --force replaces (key rotation).
+        raise SystemExit(f"REFUSED: key already in custody at {cred}. "
+                         f"Rotating? Re-run with --force to replace it.")
     src = (Path(source).expanduser() if source
            else LEGACY_KEY if account == "main"
            else Path.home() / f".keys/runpod-{account}")
@@ -475,6 +480,16 @@ class Registry:
                 f"account '{account}' has no key in custody (configured: "
                 f"{configured_accounts() or 'NONE'}). Run `podtrack adopt-key "
                 f"--account {account} --from PATH` first.")
+        # Artifact spec is REQUIRED (2026-08-09 incident: an artifactless pod
+        # was torn down mid-campaign and its outputs were unrecoverable). A pod
+        # with no declared outputs must say so explicitly via no_artifacts.
+        if not no_artifacts and not (remote_path and local_path):
+            raise SystemExit(
+                "REFUSED: register requires an artifact spec — pass both "
+                "--remote-path and --local-path (the reaper then mirrors "
+                "outputs every cycle and pull-verifies before any teardown), "
+                "or declare --no-artifacts explicitly if this pod truly "
+                "produces nothing worth keeping.")
         self.db.execute(
             "INSERT INTO pods(pod_id,owner_uuid,owner_label,gpu_type,ssh_ip,ssh_port,status,"
             "cost_per_hr,deployed_at,last_heartbeat,remote_path,local_path,ssh_key,volume_id,"
@@ -1018,6 +1033,37 @@ class Registry:
                     report["kept"].append((pid, "ttl-grace pet FAILED (busy, unreachable)"))
                 continue
 
+            # 2026-08-09 enforcement: NEVER idle-kill on API telemetry alone.
+            # RunPod's gpu_util reported 0% for a pod running at 100% (campaign
+            # incident); the kill needs the pod's own nvidia-smi to concur.
+            # Unreachable pods are NOT idle-killed here — the unreachable
+            # escalation path (#8) owns that case.
+            if idle_kill and not (abs_expired or ttl_expired):
+                rc, out, _ = ssh_run(
+                    pod, "nvidia-smi --query-gpu=utilization.gpu "
+                         "--format=csv,noheader,nounits", timeout=25)
+                util = None
+                if rc == 0:
+                    try:
+                        util = max(int(x) for x in out.split())
+                    except ValueError:
+                        pass
+                if rc == 0 and util is not None and util >= 5:
+                    print(f"# ALERT: {pid} API-idle x{strikes} but on-pod "
+                          f"nvidia-smi shows {util}% — telemetry mismatch; NOT "
+                          f"killing; strikes reset.", file=sys.stderr)
+                    self._log(pid, "idle-veto", f"nvidia-smi {util}% vs API 0")
+                    self.db.execute(
+                        "UPDATE pods SET idle_strikes=0 WHERE pod_id=?", (pid,))
+                    self.db.commit()
+                    report["kept"].append((pid, f"idle-veto: nvidia-smi {util}%"))
+                    continue
+                if rc != 0:
+                    report["kept"].append(
+                        (pid, "idle but ssh-unverifiable — deferred to "
+                              "unreachable escalation"))
+                    continue
+
             hard_kill = abs_expired or ttl_expired or idle_kill
             reason = ("abs-ttl" if abs_expired else "ttl" if ttl_expired else f"idle x{strikes}")
             if hard_kill:
@@ -1076,6 +1122,8 @@ def main():
     ak.add_argument("--from", dest="source",
                     help="key file to adopt (defaults: ~/.keys/runpod for main, "
                          "~/.keys/runpod-<account> otherwise)")
+    ak.add_argument("--force", action="store_true",
+                    help="replace a key already in custody (rotation)")
     r = sub.add_parser("register"); r.add_argument("pod_id")
     for f in ("--label", "--gpu", "--ssh-ip", "--remote-path", "--local-path", "--ssh-key"):
         r.add_argument(f)
@@ -1117,7 +1165,7 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == "adopt-key":
-        print(adopt_key(a.account, a.source)); return
+        print(adopt_key(a.account, a.source, force=a.force)); return
     if a.cmd == "accounts":
         accts = configured_accounts()
         if not accts:

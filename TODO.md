@@ -77,5 +77,25 @@ per-pod marker RunPod offers; it has no first-class label/tag API):
 - reap #12: stamp is the authority — stamped rows reap on ANY account;
   shared-accounts file now only brakes LEGACY unknown rows (no stamp proof)
 - offline test: scratchpad test_stamp_logic2.py (3 paths, ALL PASS 2026-08-07)
-- [ ] first real-pod validation: after next deploy, `podtrack probe` the pod
-      and confirm reconcile shows it stamped; then delete this line
+- [x] first real-pod validation DONE 2026-08-08: pod 5ojchk7s4ahqe0 (pro,
+      mace-a100-bench) — PODTRACK_STAMP round-tripped through the live pod
+      query as ["KEY=value"] strings; parser's string branch exercised
+
+## 2026-08-09 — Incident: reaper idle-killed its own team's BUSY campaign pod
+
+Pod 7x8qf6eziw07cv (ti2mnfe-rebracket, A100 pro) was running a 10h batched MD
+campaign at GPU 99-100%; the reaper idle-killed it 4.8h in ("idle x3" — RunPod
+API gpu_util reported 0 for 3+ consecutive reconciles) and, because the pod was
+registered with NO artifact spec, pulled nothing. ~$7.60 and the partial run lost.
+Root causes, all process: (1) no job heartbeat during a long run — the exact
+veto mechanism #7 provides; (2) no remote_path/local_path at register, so the
+per-cycle mirror never ran; (3) unclear whether gpu_util=0 was a mid-run crash
+or RunPod telemetry false-zero — evidence died with the pod.
+- [x] relaunch protocol (applied to 8dy5vflq54wzpb): register artifact spec
+      immediately; host-side job-heartbeat loop every 5 min while job lives;
+      driver writes partial_results.json every sample so mirrors are useful
+- [x] runpod_deploy.py now defaults remote_path=/workspace/out + local_path
+      for every pod (register would refuse otherwise) — DONE 2026-08-09
+- [x] podtrack 0.6.0: idle-kill requires SSH nvidia-smi confirmation (veto +
+      strike reset on mismatch; deferred when unreachable) — DONE 2026-08-09
+- [ ] podtrack: expose `register --update` instead of raw sqlite for path edits

@@ -30,7 +30,9 @@ running the reaper.
 podtrack adopt-key                 # one-time: take custody of the RunPod API key
 export PODTRACK_LABEL=my-job       # stable identity for this worker (see Identity)
 
-# after you deploy a pod, register it:
+# after you deploy a pod, register it (an artifact spec is REQUIRED —
+# it's what makes every teardown pull-verify and every reap cycle mirror;
+# pods that truly produce nothing must say --no-artifacts explicitly):
 podtrack register <pod-id> --gpu H100 --ssh-ip <ip> --ssh-port <port> \
     --remote-path /root/run/results --local-path ~/data/run --kill-in 120
 
@@ -133,6 +135,12 @@ Idle is judged from two signals so a CPU-bound stage isn't mistaken for a dead p
 utilization (from the RunPod API, or a definitive SSH `nvidia-smi` via `podtrack probe`)
 **and** a job heartbeat. A fresh heartbeat zeroes the idle strikes outright; GPU
 utilization is only the fallback signal for pods that emit no heartbeat.
+
+**An idle-kill is never executed on API telemetry alone** (as of 0.6.0): when strikes
+say "kill", the reaper first asks the pod's own `nvidia-smi` over SSH. Busy → veto,
+strikes reset, loud ALERT (RunPod's API has reported 0% for a pod running at 100%).
+Unreachable → deferred to the unreachable-escalation path. Only an SSH-confirmed 0%
+proceeds. TTL kills are unaffected — the cost backstop stays absolute.
 
 A hard `kill_after` TTL still fires regardless of activity — it's the cost backstop that
 doesn't depend on idle detection at all. **Always set one** at deploy
@@ -245,7 +253,8 @@ podtrack does about each:
 | A hard TTL kills a busy, heartbeating job | soft TTL + fresh heartbeat extends and warns; `--kill-absolute-min` for a true hard cap |
 | 0%-GPU snapshots idle-kill CPU-bound jobs | a fresh job heartbeat zeroes idle strikes; GPU-util is only the fallback signal |
 | An idle **and** SSH-unreachable pod can never be reaped (pull-verify refuses) | escalate to force-terminate after N unreachable cycles past the startup grace |
-| Teardown silently skips the artifact pull when no path was registered | loud warning on artifact-less teardown of pods older than an hour; `--no-artifacts` to opt out |
+| Teardown silently skips the artifact pull when no path was registered | **register REFUSES without an artifact spec** (or explicit `--no-artifacts`); artifact-less teardown of an old pod still warns loudly |
+| RunPod API reports 0% GPU for a busy pod → reaper kills a live job | idle-kills require SSH `nvidia-smi` confirmation; API-only idleness can never terminate a pod |
 | Network volume silently unmounts (data-center mismatch) → artifacts land on ephemeral disk | per-job volume created in a DC that has the GPU, pod pinned there, mount verified or abort |
 | A partial API response marks live pods "terminated" (invisible leak) | a pod is only marked gone after two consecutive absent fetches; a 0-pod response with known-live pods skips the sweep |
 | Leaked/untracked pods bill until a human notices | reaper auto-terminates untracked pods older than a configurable grace — but only pods carrying our `PODTRACK_STAMP` creation marker |
