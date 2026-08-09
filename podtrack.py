@@ -157,6 +157,23 @@ STAMP_ENV_KEY = "PODTRACK_STAMP"
 
 SHARED_ACCTS_PATH = CRED_DIR / "shared-accounts"
 
+EGRESS_REFS = (("github.com", 22), ("ssh.github.com", 443))
+
+
+def egress_ssh_ok(timeout: float = 6.0) -> bool:
+    """Can THIS host open SSH-class TCP connections right now? A laptop on a
+    captive-portal or port-filtered network sees every pod as unreachable; that
+    is a local network condition, not evidence about any pod. When this check
+    fails, the reaper must not count unreachability against pods."""
+    import socket
+    for host, port in EGRESS_REFS:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
 
 def shared_accounts() -> set[str]:
     """Accounts other people also use (one name per line in
@@ -254,7 +271,7 @@ def fetch_remote_pods(account: str = "main") -> list[dict]:
     q = """query { myself { pods {
         id name desiredStatus costPerHr env
         machine { gpuDisplayName }
-        runtime { uptimeInSeconds gpus { id gpuUtilPercent }
+        runtime { uptimeInSeconds gpus { id gpuUtilPercent memoryUtilPercent }
                   ports { ip publicPort privatePort type } } } } }"""
     pods = (gql(q, account=account).get("myself") or {}).get("pods") or []
     norm = []
@@ -281,6 +298,7 @@ def fetch_remote_pods(account: str = "main") -> list[dict]:
             "gpu_type": (p.get("machine") or {}).get("gpuDisplayName"),
             "n_gpus": len(gpus), "uptime_s": rt.get("uptimeInSeconds"),
             "gpu_util": max((g.get("gpuUtilPercent") or 0) for g in gpus) if gpus else None,
+            "mem_util": max((g.get("memoryUtilPercent") or 0) for g in gpus) if gpus else None,
             "ssh_ip": ssh_ip, "ssh_port": ssh_port, "account": account,
             "stamped": stamped})
     return norm
@@ -822,7 +840,8 @@ class Registry:
             for pid, rp in remote.items():
                 running = rp["desired"] == "RUNNING"
                 if running and (not rp["n_gpus"] or
-                                (rp["gpu_util"] == 0 and (rp["uptime_s"] or 0) > 600)):
+                                (rp["gpu_util"] == 0 and (rp.get("mem_util") or 0) <= 1
+                                 and (rp["uptime_s"] or 0) > 600)):
                     s["idle_or_cpu"].append(pid)
                 if pid in known:
                     # account=? self-heals a row filed under the wrong account —
@@ -996,7 +1015,16 @@ class Registry:
                           file=sys.stderr)
                     report["kept"].append((pid, "mirror-FAILED"))
             reachable = self._read_remote_heartbeat(pod)
-            sfs = 0 if reachable else (pod["ssh_fail_streak"] or 0) + 1
+            if reachable:
+                sfs = 0
+            elif egress_ssh_ok():
+                sfs = (pod["ssh_fail_streak"] or 0) + 1
+            else:
+                # OUR network can't make SSH-class connections at all — pod
+                # unreachability proves nothing this cycle; freeze the streak.
+                print(f"# WARN: local egress check failed — not counting "
+                      f"unreachability against {pid} this cycle.", file=sys.stderr)
+                sfs = pod["ssh_fail_streak"] or 0
             self.db.execute("UPDATE pods SET ssh_fail_streak=? WHERE pod_id=?", (sfs, pid))
             self.db.commit()
             pod = self.get(pid)                                  # reload after hb/streak updates
@@ -1013,7 +1041,11 @@ class Registry:
             self.db.commit()
 
             # #8 unreachable-escalation: idle + SSH-dead for N reaps past grace = leak.
-            if sfs >= unreachable_reaps_needed and gpu_idle_now and not young and not fresh_hb:
+            # Requires SUSTAINED API-idleness (consecutive strikes), not a single
+            # coincident zero-sample from a bursty utilization metric.
+            if (sfs >= unreachable_reaps_needed and gpu_idle_now
+                    and strikes >= idle_strikes_needed
+                    and not young and not fresh_hb):
                 print(f"# ALERT: {pid} idle AND SSH-unreachable for {sfs} reaps — "
                       f"force-terminating (un-reapable leak; last mirror was while reachable).",
                       file=sys.stderr)
